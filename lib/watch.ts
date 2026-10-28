@@ -27,16 +27,6 @@ export function resolveWatchers(
   return result;
 }
 
-/** Pure: whether one person is watching, given the same inputs. */
-export function isWatchingIssue(
-  userId: string,
-  defaults: readonly (string | null | undefined)[],
-  row: WatchRow | null | undefined,
-): boolean {
-  if (row) return row.watching;
-  return defaults.includes(userId);
-}
-
 type Db = Pick<PrismaClient, "issueWatch"> | Pick<Prisma.TransactionClient, "issueWatch">;
 
 /** Everyone who should hear about an event on this issue. */
@@ -50,6 +40,15 @@ export async function watchersFor(
     select: { userId: true, watching: true },
   });
   return resolveWatchers(defaults, rows);
+}
+
+/** People who explicitly muted this issue, so reply planners can skip them (#738). */
+export async function mutedUsersFor(db: Db, bugId: string): Promise<string[]> {
+  const rows = await db.issueWatch.findMany({
+    where: { bugId },
+    select: { userId: true, watching: true },
+  });
+  return rows.filter((row) => !row.watching).map((row) => row.userId);
 }
 
 /**

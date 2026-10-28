@@ -24,6 +24,8 @@ export function AssigneeCombobox({
   defaultValue = "",
   onChange,
   inputClassName = "",
+  "aria-label": ariaLabel,
+  "aria-labelledby": ariaLabelledBy,
 }: {
   id: string;
   name: string;
@@ -33,6 +35,8 @@ export function AssigneeCombobox({
   defaultValue?: string;
   onChange?: (assigneeId: string) => void;
   inputClassName?: string;
+  "aria-label"?: string;
+  "aria-labelledby"?: string;
 }) {
   const listId = useId();
   const [ownValue, setOwnValue] = useState(defaultValue);
@@ -89,6 +93,11 @@ export function AssigneeCombobox({
   };
 
   const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
+    // An IME uses Enter and the arrow keys to commit or browse candidates.
+    // Acting on them here would pick an assignee mid-composition (#483), so
+    // leave every key alone until the composition ends. `keyCode === 229` is
+    // the fallback browsers report when `isComposing` is already false.
+    if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
     switch (event.key) {
       case "ArrowDown":
         event.preventDefault();
@@ -132,9 +141,12 @@ export function AssigneeCombobox({
         role="combobox"
         autoComplete="off"
         spellCheck={false}
+        aria-label={ariaLabel ?? (ariaLabelledBy ? undefined : "Assignee")}
+        aria-labelledby={ariaLabelledBy}
+        aria-haspopup="listbox"
         aria-autocomplete="list"
         aria-expanded={open}
-        aria-controls={listId}
+        aria-controls={open ? listId : undefined}
         aria-activedescendant={activeOption ? `${listId}-${activeOption.id || "none"}` : undefined}
         placeholder={open ? "Search by name" : undefined}
         value={open ? query : labelFor(selectedId)}
@@ -170,7 +182,7 @@ export function AssigneeCombobox({
           ref={listRef}
           id={listId}
           role="listbox"
-          aria-label="People"
+          aria-label="Assignees"
           tabIndex={-1}
           className="absolute left-0 z-30 mt-1 max-h-64 w-full min-w-[14rem] overflow-y-auto rounded-lg border border-slate-200 bg-white py-1 text-sm shadow-lg"
         >
@@ -183,6 +195,10 @@ export function AssigneeCombobox({
               const selected = option.id === selectedId;
               const active = index === activeIndex;
               return (
+                // Options follow the aria-activedescendant combobox pattern:
+                // the input owns Arrow/Enter handling, so the list items carry
+                // no key handlers of their own (adding them would double-fire).
+                // eslint-disable-next-line jsx-a11y/click-events-have-key-events
                 <li
                   key={option.id || "none"}
                   id={`${listId}-${option.id || "none"}`}

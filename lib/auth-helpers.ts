@@ -12,6 +12,7 @@ import { isPasswordAuthEnabled } from "@/lib/auth-mode";
 import { upsertGoogleUser } from "@/lib/google-user";
 import { resolveSessionUserId } from "@/lib/session-user";
 import { isSuperAdminEmail } from "@/lib/super-admin";
+import { logger } from "@/lib/logger";
 
 /** Route handler that clears an invalid session (see app/session-expired/route.ts). */
 export const SESSION_EXPIRED_PATH = "/session-expired";
@@ -44,21 +45,22 @@ export async function requireUser(): Promise<SessionAppUser> {
   let userId: string;
   if ("error" in resolved) {
     const email = session.user.email?.toLowerCase();
-    // Google-only production has no password reset. A session with an email
-    // and no matching row was saved under Google's subject, not User.id.
+    // A session with an email and no matching row was saved under Google's subject, not User.id.
     if (!email || isPasswordAuthEnabled()) {
       redirect(SESSION_EXPIRED_PATH);
     }
     try {
-      userId = (
-        await upsertGoogleUser({
-          email,
-          name: session.user.name,
-          image: session.user.image,
-        })
-      ).id;
+      const googleAccount = await upsertGoogleUser({
+        email,
+        name: session.user.name,
+        image: session.user.image,
+      });
+      if ((session.user.sessionVersion ?? 0) !== googleAccount.sessionVersion) {
+        redirect(SESSION_EXPIRED_PATH);
+      }
+      userId = googleAccount.id;
     } catch (error) {
-      console.error("[auth] Google session could not be linked to a user", error);
+      logger.error("[auth] Google session could not be linked to a user", error);
       redirect(SESSION_EXPIRED_PATH);
     }
   } else {
@@ -68,18 +70,29 @@ export async function requireUser(): Promise<SessionAppUser> {
   const dbUser = await prisma.user
     .findUnique({
       where: { id: userId },
-      select: { id: true, name: true, email: true, image: true, role: true },
+      select: { id: true, name: true, email: true, image: true, role: true, sessionVersion: true },
     })
     .catch(async () => {
       const basic = await prisma.user.findUnique({
         where: { id: userId },
-        select: { id: true, name: true, email: true },
+        select: { id: true, name: true, email: true, sessionVersion: true },
       });
       if (!basic) return null;
-      return { ...basic, image: null, role: "user" as Role };
+      return { ...basic, image: null, role: "user" as Role, sessionVersion: basic.sessionVersion ?? 0 };
     });
 
   if (!dbUser) {
+    redirect(SESSION_EXPIRED_PATH);
+  }
+
+  // Reject session when sessionVersion or role does not match DB (#655)
+  const tokenVersion = session.user.sessionVersion ?? 0;
+  const userVersion = (dbUser as { sessionVersion?: number }).sessionVersion ?? 0;
+  if (tokenVersion !== userVersion) {
+    redirect(SESSION_EXPIRED_PATH);
+  }
+
+  if (session.user.role && session.user.role !== dbUser.role) {
     redirect(SESSION_EXPIRED_PATH);
   }
 
@@ -91,11 +104,15 @@ export async function requireUser(): Promise<SessionAppUser> {
     try {
       await prisma.user.update({
         where: { id: dbUser.id },
-        data: { role: "super_admin" },
+        data: { role: "super_admin", sessionVersion: { increment: 1 } },
+      });
+      logger.info("[auth] privilege change: super admin role updated via email", {
+        userId: dbUser.id,
+        email: dbUser.email,
       });
       dbUser.role = "super_admin";
     } catch (error) {
-      console.error("[auth] super admin role update failed", error);
+      logger.error("[auth] super admin role update failed", error);
     }
   }
 
@@ -119,28 +136,28 @@ export async function requireUser(): Promise<SessionAppUser> {
   };
 }
 
-/** Require one of the given roles. Redirects unauthorized users to /bugs. */
+/** Require one of the given roles. Redirects unauthorized users to /issues. */
 export async function requireRole(
   roles: Role | Role[],
 ): Promise<SessionAppUser> {
   const user = await requireUser();
   const allowed = Array.isArray(roles) ? roles : [roles];
   if (!allowed.includes(user.role)) {
-    redirect("/bugs");
+    redirect("/issues");
   }
   return user;
 }
 
-/** Admin or super_admin. Redirects non-admins to /bugs. */
+/** Admin or super_admin. Redirects non-admins to /issues. */
 export async function requireAdmin(): Promise<SessionAppUser> {
   const user = await requireUser();
   if (!isAdmin(user.role)) {
-    redirect("/bugs");
+    redirect("/issues");
   }
   return user;
 }
 
-/** Super admin only. Redirects everyone else to /bugs. */
+/** Super admin only. Redirects everyone else to /issues. */
 export async function requireSuperAdmin(): Promise<SessionAppUser> {
   return requireRole("super_admin");
 }

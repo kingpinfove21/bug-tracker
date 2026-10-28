@@ -1,5 +1,8 @@
 import { execSync } from "child_process";
-import { existsSync } from "fs";
+import { existsSync, unlinkSync, writeFileSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
+import { databaseHost, migrationDatabaseUrl } from "./migration-database-url.mjs";
 
 /**
  * Container start step: apply pending Prisma migrations, nothing else (#112).
@@ -9,32 +12,50 @@ import { existsSync } from "fs";
  * which silently drops columns/tables that schema.prisma no longer has.
  *
  * If deploy stops early, scripts/sql/ensure-bug-number.sql still adds the
- * missing issue reference column. It does not drop anything.
+ * missing issue reference column, scripts/sql/ensure-bug-duplicates.sql adds
+ * Bug.duplicateOfId, and scripts/sql/ensure-agent-key-project-scope.sql adds
+ * AgentApiKey.projectId and AgentPairing.projectId. scripts/sql/ensure-shipped-agent-schema.sql
+ * adds the personal-agent columns, issue bids, and redesign preview columns.
+ * None of them drop anything.
  */
 
-let url = process.env.DATABASE_URL;
-if (url) {
-  url = url.trim();
-  if (
-    (url.startsWith('"') && url.endsWith('"')) ||
-    (url.startsWith("'") && url.endsWith("'"))
-  ) {
-    url = url.slice(1, -1).trim();
+/**
+ * #580: whether a migration that is still failing after every repair step
+ * should stop the container. True in production, so the server never starts
+ * on a schema its code doesn't match: the Dockerfile only runs `pnpm run start`
+ * when this script exits 0, and Coolify keeps the previous container serving.
+ * ALLOW_START_WITH_FAILED_MIGRATION=true is the escape hatch for an incident
+ * where starting anyway is the lesser evil. Outside production it only warns.
+ */
+function stopOnFailure() {
+  return (
+    process.env.NODE_ENV === "production" &&
+    process.env.ALLOW_START_WITH_FAILED_MIGRATION !== "true"
+  );
+}
+
+const pooledUrl = process.env.DATABASE_URL;
+const migrationUrl = migrationDatabaseUrl(pooledUrl, process.env.DIRECT_URL);
+if (migrationUrl) {
+  process.env.DATABASE_URL = migrationUrl;
+  if (migrationUrl !== pooledUrl) {
+    console.log(
+      `[db:migrate] Migrations use a direct connection (${databaseHost(migrationUrl)}). The app keeps the pooled URL.`,
+    );
   }
-  process.env.DATABASE_URL = url;
 }
 
 if (!process.env.DATABASE_URL) {
   console.warn(
     "[db:migrate] WARNING: DATABASE_URL is not set. Skipping database migrations.",
   );
-  // #220: this used to exit 0 even outside development, so a container with a
-  // missing env var started normally against an unmigrated database - the exact
-  // outcome the doc comment above promises to prevent.
-  if (process.env.NODE_ENV === "production") {
-    console.warn(
-      "[db:migrate] WARNING: DATABASE_URL is not set. Skipping database migrations and proceeding to server startup.",
+  // #220, #580: in production a missing DATABASE_URL means the app would start
+  // against no database at all, so stop here and let the deploy fail.
+  if (stopOnFailure()) {
+    console.error(
+      "[db:migrate] DATABASE_URL is not set in production. Not starting the server.",
     );
+    process.exit(1);
   }
   process.exit(0);
 }
@@ -44,33 +65,187 @@ const prismaBin = existsSync("./node_modules/.bin/prisma")
   : "pnpm exec prisma";
 
 const bugNumberMigration = "20261017140000_bug_reference_number";
+const duplicateMigration = "20261019020000_bug_duplicates";
+const milestoneMigration = "20261019030000_milestones";
 const detailMigrations = [
   "20261017140000_issue_watch_and_notifications",
   "20261017150000_attachments",
 ];
+const userSettingsMigrations = [
+  "20261017100000_user_email_notifications",
+  "20261017150000_notification_preferences",
+  "20261020000000_keyboard_shortcuts",
+  "20261020010000_theme_preference",
+];
+const agentPlatformMigration = "20261021000000_agent_platform";
+const agentKeyProjectScopeMigration = "20261022120000_agent_key_project_scope";
+const initMigration = "20261014193427_init";
+const redesignPreviewMigration = "20261022000000_redesign_mockups_and_choice";
+const disputeRequestedRoleMigration = "20261022120000_dispute_requested_role";
+const defaultProjectKeyMigration = "20261022150000_default_project_agent_key";
+const issueBidsMigration = "20261022160000_issue_bids";
 
-function runPrisma(args, inherit = false) {
-  return execSync(`${prismaBin} ${args}`, {
-    stdio: inherit ? "inherit" : "pipe",
-    encoding: "utf8",
-    env: process.env,
-  });
+function runPrisma(args) {
+  try {
+    const stdout = execSync(`${prismaBin} ${args}`, {
+      encoding: "utf8",
+      env: process.env,
+      stdio: ["inherit", "pipe", "pipe"],
+    });
+    if (stdout) process.stdout.write(stdout);
+    return stdout;
+  } catch (error) {
+    const stdout = typeof error.stdout === "string" ? error.stdout : "";
+    const stderr = typeof error.stderr === "string" ? error.stderr : "";
+    if (stdout) process.stdout.write(stdout);
+    if (stderr) process.stderr.write(stderr);
+    const wrapped = new Error([stderr, error instanceof Error ? error.message : String(error)].filter(Boolean).join("\n"));
+    throw wrapped;
+  }
+}
+
+function recordApplied(name) {
+  try {
+    runPrisma(`migrate resolve --applied ${name}`);
+    console.log(`[db:migrate] Recorded ${name} as applied.`);
+    return true;
+  } catch (resolveError) {
+    const message = resolveError instanceof Error ? resolveError.message : String(resolveError);
+    console.log(`[db:migrate] ${name} was already recorded:`, message.split("\n")[0]);
+    if (/already recorded|already applied|P3008/i.test(message)) return true;
+    if (/failed|P3018|P3009|P3012/i.test(message)) {
+      try {
+        runPrisma(`migrate resolve --rolled-back ${name}`);
+        runPrisma(`migrate resolve --applied ${name}`);
+        console.log(`[db:migrate] Recorded ${name} as applied.`);
+        return true;
+      } catch (retryResolveError) {
+        console.error(
+          `[db:migrate] Could not record ${name}:`,
+          retryResolveError instanceof Error
+            ? retryResolveError.message.split("\n")[0]
+            : retryResolveError,
+        );
+        return false;
+      }
+    }
+    return false;
+  }
+}
+
+function failedMigrationName(text) {
+  const started = text.match(/The `([^`]+)` migration started at [^\n]* failed/);
+  if (started) return started[1];
+  const named = text.match(/Migration name:\s*(\S+)/);
+  return named ? named[1] : null;
+}
+
+function isDuplicateObjectFailure(text) {
+  return (
+    /P3018/.test(text) &&
+    (/already exists/.test(text) || /\b42P07\b/.test(text) || /\b42701\b/.test(text) || /\b42710\b/.test(text))
+  );
+}
+
+function initTablesPresent() {
+  const file = join(tmpdir(), "ziki-init-probe.sql");
+  writeFileSync(
+    file,
+    "DO $$ BEGIN\n  IF to_regclass('public.\"User\"') IS NULL THEN\n    RAISE EXCEPTION 'missing User';\n  END IF;\nEND $$;\n",
+  );
+  try {
+    runPrisma(`db execute --schema prisma/schema.prisma --file ${JSON.stringify(file)}`);
+    return true;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    console.error("[db:migrate] Init schema probe did not find User:", message.split("\n")[0]);
+    return false;
+  } finally {
+    try {
+      unlinkSync(file);
+    } catch {
+      // The probe file is only a signal. A leftover does not change the database.
+    }
+  }
+}
+
+function baselineStuckMigrations(initialText) {
+  let text = initialText;
+  for (let attempt = 0; attempt < 80; attempt += 1) {
+    const name = failedMigrationName(text);
+    if (!name) return false;
+    if (/P3009/.test(text)) {
+      if (name !== initMigration) {
+        console.error(`[db:migrate] ${name} is recorded as failed. Not marking it applied.`);
+        return false;
+      }
+      if (!initTablesPresent()) return false;
+      console.log("[db:migrate] Init is recorded as failed but User already exists. Recording it as applied.");
+    } else if (isDuplicateObjectFailure(text)) {
+      console.log(`[db:migrate] ${name} failed because the objects already exist. Recording it as applied.`);
+    } else {
+      return false;
+    }
+    if (!recordApplied(name)) return false;
+    try {
+      deploy();
+      return true;
+    } catch (error) {
+      text = error instanceof Error ? error.message : String(error);
+      console.error("[db:migrate] prisma migrate deploy encountered error:", text);
+    }
+  }
+  console.error("[db:migrate] Stopped baselining after 80 attempts.");
+  return false;
 }
 
 function deploy() {
   console.log(`[db:migrate] Running ${prismaBin} migrate deploy...`);
-  runPrisma("migrate deploy", true);
+  runPrisma("migrate deploy");
   console.log("[db:migrate] Migrations applied.");
 }
 
+let firstDeployFailed = false;
+let deployErrorText = "";
 try {
   deploy();
 } catch (error) {
-  console.error(
-    "[db:migrate] prisma migrate deploy encountered error:",
-    error instanceof Error ? error.message : String(error),
-  );
+  firstDeployFailed = true;
+  deployErrorText = error instanceof Error ? error.message : String(error);
+  console.error("[db:migrate] prisma migrate deploy encountered error:", deployErrorText);
 }
+
+// Coolify Postgres has 20261014193427_init recorded as failed since 2026-10-15.
+// Deploy refuses to continue (P3009), the server never listens, and the new
+// container is rolled back. The live app already has User, so mark that row
+// applied and retry. A later migration that only fails because its objects
+// already exist is recorded the same way. Anything else still stops startup.
+if (firstDeployFailed && baselineStuckMigrations(deployErrorText)) {
+  firstDeployFailed = false;
+}
+
+// A normal container start runs `migrate deploy` only (#581). The repair
+// steps below exist to unstick databases from an earlier incident; leave them
+// available but opt-in, and say so in the log when they do run.
+if (process.env.MIGRATION_REPAIR !== "1") {
+  if (firstDeployFailed) {
+    if (stopOnFailure()) {
+      console.error(
+        "[db:migrate] Not starting the server. Fix the migration, or set ALLOW_START_WITH_FAILED_MIGRATION=true to start anyway.",
+      );
+      process.exit(1);
+    }
+    console.warn("[db:migrate] Continuing outside production.");
+  } else {
+    console.log(
+      "[db:migrate] Repair steps skipped (set MIGRATION_REPAIR=1 to run the legacy repairs once).",
+    );
+  }
+  process.exit(0);
+}
+console.log(
+  "[db:migrate] MIGRATION_REPAIR=1: running legacy repair steps; every action below is logged.",
+);
 
 // migrate deploy can stop on an earlier failure and never reach the reference
 // number migration. db push is not used here: without --accept-data-loss it
@@ -131,4 +306,354 @@ try {
     "[db:migrate] Could not add Bug.number:",
     ensureError instanceof Error ? ensureError.message : String(ensureError),
   );
+}
+
+// The issues list filters on Bug.duplicateOfId. If an earlier migration is
+// stuck, deploy never reaches 20261019020000_bug_duplicates and every list
+// request fails. Add the column, then record that migration so the retry
+// does not try to add it again.
+try {
+  console.log("[db:migrate] Ensuring Bug.duplicateOfId exists...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-bug-duplicates.sql",
+    true,
+  );
+  console.log("[db:migrate] Bug.duplicateOfId is present.");
+  try {
+    runPrisma(
+      "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-duplicate-activity-type.sql",
+      true,
+    );
+  } catch (enumError) {
+    console.error(
+      "[db:migrate] Could not add ActivityType duplicate_changed:",
+      enumError instanceof Error ? enumError.message.split("\n")[0] : enumError,
+    );
+  }
+  try {
+    runPrisma(`migrate resolve --applied ${duplicateMigration}`, true);
+    console.log(`[db:migrate] Recorded ${duplicateMigration} as applied.`);
+  } catch (resolveError) {
+    const message =
+      resolveError instanceof Error ? resolveError.message : String(resolveError);
+    console.log(
+      "[db:migrate] Duplicate migration was already recorded:",
+      message.split("\n")[0],
+    );
+    // A failed row blocks resolve --applied. Clear it, then record the repair.
+    if (/failed|P3018|P3009/i.test(message)) {
+      try {
+        runPrisma(`migrate resolve --rolled-back ${duplicateMigration}`, true);
+        runPrisma(`migrate resolve --applied ${duplicateMigration}`, true);
+        console.log(`[db:migrate] Recorded ${duplicateMigration} as applied.`);
+      } catch (retryResolveError) {
+        console.error(
+          "[db:migrate] Could not record the duplicate migration:",
+          retryResolveError instanceof Error
+            ? retryResolveError.message.split("\n")[0]
+            : retryResolveError,
+        );
+      }
+    }
+  }
+  try {
+    deploy();
+  } catch (retryError) {
+    console.error(
+      "[db:migrate] migrate deploy still failing after duplicate repair:",
+      retryError instanceof Error ? retryError.message : String(retryError),
+    );
+  }
+} catch (duplicateError) {
+  console.error(
+    "[db:migrate] Could not add Bug.duplicateOfId:",
+    duplicateError instanceof Error ? duplicateError.message : String(duplicateError),
+  );
+}
+
+// #289: The issue page queries Bug.milestoneId and Milestone. If an earlier
+// migration failed or stopped, deploy never reaches 20261019030000_milestones
+// and issue detail pages crash. Add the table and column, then record that
+// migration so the retry does not try to add it again.
+try {
+  console.log("[db:migrate] Ensuring Milestone and Bug.milestoneId exist...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-milestones.sql",
+    true,
+  );
+  console.log("[db:migrate] Milestone and Bug.milestoneId are present.");
+  try {
+    runPrisma(
+      "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-milestone-activity-type.sql",
+      true,
+    );
+  } catch (enumError) {
+    console.error(
+      "[db:migrate] Could not add ActivityType milestone_changed:",
+      enumError instanceof Error ? enumError.message.split("\n")[0] : enumError,
+    );
+  }
+  try {
+    runPrisma(`migrate resolve --applied ${milestoneMigration}`, true);
+    console.log(`[db:migrate] Recorded ${milestoneMigration} as applied.`);
+  } catch (resolveError) {
+    const message =
+      resolveError instanceof Error ? resolveError.message : String(resolveError);
+    console.log(
+      "[db:migrate] Milestone migration was already recorded:",
+      message.split("\n")[0],
+    );
+    // A failed row blocks resolve --applied. Clear it, then record the repair.
+    if (/failed|P3018|P3009/i.test(message)) {
+      try {
+        runPrisma(`migrate resolve --rolled-back ${milestoneMigration}`, true);
+        runPrisma(`migrate resolve --applied ${milestoneMigration}`, true);
+        console.log(`[db:migrate] Recorded ${milestoneMigration} as applied.`);
+      } catch (retryResolveError) {
+        console.error(
+          "[db:migrate] Could not record the milestone migration:",
+          retryResolveError instanceof Error
+            ? retryResolveError.message.split("\n")[0]
+            : retryResolveError,
+        );
+      }
+    }
+  }
+  try {
+    deploy();
+  } catch (retryError) {
+    console.error(
+      "[db:migrate] migrate deploy still failing after milestone repair:",
+      retryError instanceof Error ? retryError.message : String(retryError),
+    );
+  }
+} catch (milestoneError) {
+  console.error(
+    "[db:migrate] Could not add Milestone or Bug.milestoneId:",
+    milestoneError instanceof Error ? milestoneError.message : String(milestoneError),
+  );
+}
+
+// Settings page queries User.theme, User.keyboardShortcuts, and email notification preferences.
+// If an earlier migration was stuck, deploy never reaches those migrations and settings crashes.
+try {
+  console.log("[db:migrate] Ensuring User settings columns and ThemePreference exist...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-user-settings.sql",
+    true,
+  );
+  console.log("[db:migrate] User settings columns are present.");
+  for (const name of userSettingsMigrations) {
+    try {
+      runPrisma(`migrate resolve --applied ${name}`, true);
+      console.log(`[db:migrate] Recorded ${name} as applied.`);
+    } catch (resolveError) {
+      const message =
+        resolveError instanceof Error ? resolveError.message : String(resolveError);
+      console.log(
+        `[db:migrate] ${name} was already recorded:`,
+        message.split("\n")[0],
+      );
+      if (/failed|P3018|P3009/i.test(message)) {
+        try {
+          runPrisma(`migrate resolve --rolled-back ${name}`, true);
+          runPrisma(`migrate resolve --applied ${name}`, true);
+          console.log(`[db:migrate] Recorded ${name} as applied.`);
+        } catch (retryResolveError) {
+          console.error(
+            `[db:migrate] Could not record ${name}:`,
+            retryResolveError instanceof Error
+              ? retryResolveError.message.split("\n")[0]
+              : retryResolveError,
+          );
+        }
+      }
+    }
+  }
+  try {
+    deploy();
+  } catch (retryError) {
+    console.error(
+      "[db:migrate] migrate deploy still failing after user settings repair:",
+      retryError instanceof Error ? retryError.message : String(retryError),
+    );
+  }
+} catch (settingsError) {
+  console.error(
+    "[db:migrate] Could not add User settings columns:",
+    settingsError instanceof Error ? settingsError.message : String(settingsError),
+  );
+}
+
+// Agent platform data model (tenants, projects, memberships, agent tables, Bug/Comment columns).
+// If an earlier migration was stuck or 20261021000000_agent_platform failed partially,
+// migrate deploy halts and /issues, /tenants, and layout crash.
+try {
+  console.log("[db:migrate] Ensuring Agent platform schema (tenants, projects, memberships) exists...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-agent-platform.sql",
+    true,
+  );
+  console.log("[db:migrate] Agent platform schema is present.");
+  try {
+    runPrisma(`migrate resolve --applied ${agentPlatformMigration}`, true);
+    console.log(`[db:migrate] Recorded ${agentPlatformMigration} as applied.`);
+  } catch (resolveError) {
+    const message =
+      resolveError instanceof Error ? resolveError.message : String(resolveError);
+    console.log(
+      `[db:migrate] ${agentPlatformMigration} was already recorded:`,
+      message.split("\n")[0],
+    );
+    if (/failed|P3018|P3009/i.test(message)) {
+      try {
+        runPrisma(`migrate resolve --rolled-back ${agentPlatformMigration}`, true);
+        runPrisma(`migrate resolve --applied ${agentPlatformMigration}`, true);
+        console.log(`[db:migrate] Recorded ${agentPlatformMigration} as applied.`);
+      } catch (retryResolveError) {
+        console.error(
+          `[db:migrate] Could not record ${agentPlatformMigration}:`,
+          retryResolveError instanceof Error
+            ? retryResolveError.message.split("\n")[0]
+            : retryResolveError,
+        );
+      }
+    }
+  }
+  try {
+    deploy();
+  } catch (retryError) {
+    console.error(
+      "[db:migrate] migrate deploy still failing after agent platform repair:",
+      retryError instanceof Error ? retryError.message : String(retryError),
+    );
+  }
+} catch (agentPlatformError) {
+  console.error(
+    "[db:migrate] Could not add Agent platform schema:",
+    agentPlatformError instanceof Error ? agentPlatformError.message : String(agentPlatformError),
+  );
+}
+
+// Pairing's insert returns AgentPairing.projectId (#742). If an earlier
+// migration is stuck, deploy never reaches 20261022120000_agent_key_project_scope
+// and POST /api/v1/agents/pairing returns 500 after the name is accepted.
+try {
+  console.log("[db:migrate] Ensuring agent key project columns exist...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-agent-key-project-scope.sql",
+    true,
+  );
+  console.log("[db:migrate] AgentApiKey.projectId and AgentPairing.projectId are present.");
+  try {
+    runPrisma(`migrate resolve --applied ${agentKeyProjectScopeMigration}`, true);
+    console.log(`[db:migrate] Recorded ${agentKeyProjectScopeMigration} as applied.`);
+  } catch (resolveError) {
+    const message =
+      resolveError instanceof Error ? resolveError.message : String(resolveError);
+    console.log(
+      `[db:migrate] ${agentKeyProjectScopeMigration} was already recorded:`,
+      message.split("\n")[0],
+    );
+    if (/failed|P3018|P3009/i.test(message)) {
+      try {
+        runPrisma(`migrate resolve --rolled-back ${agentKeyProjectScopeMigration}`, true);
+        runPrisma(`migrate resolve --applied ${agentKeyProjectScopeMigration}`, true);
+        console.log(`[db:migrate] Recorded ${agentKeyProjectScopeMigration} as applied.`);
+      } catch (retryResolveError) {
+        console.error(
+          `[db:migrate] Could not record ${agentKeyProjectScopeMigration}:`,
+          retryResolveError instanceof Error
+            ? retryResolveError.message.split("\n")[0]
+            : retryResolveError,
+        );
+      }
+    }
+  }
+  try {
+    deploy();
+  } catch (retryError) {
+    console.error(
+      "[db:migrate] migrate deploy still failing after agent key project repair:",
+      retryError instanceof Error ? retryError.message : String(retryError),
+    );
+  }
+} catch (projectScopeError) {
+  console.error(
+    "[db:migrate] Could not add agent key project columns:",
+    projectScopeError instanceof Error ? projectScopeError.message : String(projectScopeError),
+  );
+}
+
+// Issue pages select RedesignProposal.previewUrl and IssueBid. The header
+// creates a personal agent, which writes Agent.defaultProjectId and
+// AgentApiKey.sealedKey. A stuck earlier migration never reaches those files,
+// and the signed-in app then crashes on the missing relation.
+try {
+  console.log("[db:migrate] Ensuring redesign status value exists...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-redesign-status.sql",
+    true,
+  );
+} catch (enumError) {
+  console.error(
+    "[db:migrate] Could not add RedesignStatus superseded:",
+    enumError instanceof Error ? enumError.message.split("\n")[0] : enumError,
+  );
+}
+try {
+  console.log("[db:migrate] Ensuring personal agent columns, bids, and redesign preview exist...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-shipped-agent-schema.sql",
+    true,
+  );
+  console.log("[db:migrate] Personal agent columns, bids, and redesign preview are present.");
+  for (const name of [redesignPreviewMigration, defaultProjectKeyMigration, issueBidsMigration]) {
+    recordApplied(name);
+  }
+  try {
+    deploy();
+  } catch (retryError) {
+    console.error(
+      "[db:migrate] migrate deploy still failing after shipped agent schema repair:",
+      retryError instanceof Error ? retryError.message : String(retryError),
+    );
+  }
+} catch (shippedSchemaError) {
+  console.error(
+    "[db:migrate] Could not add personal agent columns, bids, or redesign preview:",
+    shippedSchemaError instanceof Error ? shippedSchemaError.message : String(shippedSchemaError),
+  );
+}
+try {
+  console.log("[db:migrate] Ensuring PointDispute.requestedRole exists...");
+  runPrisma(
+    "db execute --schema prisma/schema.prisma --file scripts/sql/ensure-dispute-requested-role.sql",
+    true,
+  );
+  recordApplied(disputeRequestedRoleMigration);
+} catch (disputeRoleError) {
+  console.error(
+    "[db:migrate] Could not add PointDispute.requestedRole:",
+    disputeRoleError instanceof Error ? disputeRoleError.message : String(disputeRoleError),
+  );
+}
+
+// #580: every repair above has had its turn. One last `migrate deploy` must
+// succeed (it is a no-op when everything is applied); if it doesn't, the
+// schema is still behind the code and the server must not start on it.
+try {
+  deploy();
+} catch (finalError) {
+  console.error(
+    "[db:migrate] Migrations are still failing after every repair step:",
+    finalError instanceof Error ? finalError.message : String(finalError),
+  );
+  if (stopOnFailure()) {
+    console.error(
+      "[db:migrate] Not starting the server. Fix the migration, or set ALLOW_START_WITH_FAILED_MIGRATION=true to start anyway.",
+    );
+    process.exit(1);
+  }
+  console.warn("[db:migrate] Continuing outside production.");
 }

@@ -11,43 +11,89 @@ import { BASE_PATH, toAppPath } from "@/lib/base-path";
  */
 const { auth } = NextAuth(authConfig);
 
-/** Bug detail paths only — enough for unfurl bots to hit generateMetadata. */
-const BUG_DETAIL_PATH = /^\/bugs\/[^/]+\/?$/;
+/** Issue detail paths only — enough for unfurl bots to hit generateMetadata. */
+const ISSUE_DETAIL_PATH = /^\/(?:issues|bugs)\/[^/]+\/?$/;
 
-export default auth((req) => {
-  const pathWithoutBase = toAppPath(req.nextUrl.pathname);
-  const isLoggedIn = !!req.auth?.user;
-
+export function isPublicPath(
+  pathWithoutBase: string,
+  userAgent?: string | null,
+): boolean {
   const isAuthPage =
     pathWithoutBase.startsWith("/login") || pathWithoutBase.startsWith("/signup");
   const isPasswordResetPage =
     pathWithoutBase.startsWith("/forgot-password") ||
     pathWithoutBase.startsWith("/reset-password");
-  const isBugPreview =
-    BUG_DETAIL_PATH.test(pathWithoutBase) &&
-    isLinkPreviewBot(req.headers.get("user-agent"));
-  const isPublic =
+  const isIssuePreview =
+    ISSUE_DETAIL_PATH.test(pathWithoutBase) &&
+    isLinkPreviewBot(userAgent);
+
+  return (
+    pathWithoutBase === "/" ||
+    pathWithoutBase === "" ||
+    pathWithoutBase === "/llms.txt" ||
     isAuthPage ||
     isPasswordResetPage ||
-    isBugPreview ||
+    isIssuePreview ||
+    pathWithoutBase === "/" ||
+    pathWithoutBase.startsWith("/session-expired") ||
+    // Shareable invite links (#444). Guests must see the organization and
+    // sign in with Google before the link is used; the page itself never
+    // spends a use.
+    pathWithoutBase === "/join" ||
+    pathWithoutBase.startsWith("/join/") ||
     pathWithoutBase.startsWith("/api/auth") ||
     pathWithoutBase.startsWith("/api/health") ||
+    // GitHub calls this with an HMAC signature, not a session (#474).
+    pathWithoutBase === "/api/github/webhook" ||
+    // The agent API (#427) authenticates every call with an agent key, not a
+    // session; each route rejects a request without one.
+    pathWithoutBase.startsWith("/api/v1/") ||
     pathWithoutBase.startsWith("/_next") ||
-    pathWithoutBase === "/favicon.ico";
+    pathWithoutBase === "/favicon.ico"
+  );
+}
+
+export default auth((req) => {
+  const pathWithoutBase = toAppPath(req.nextUrl.pathname);
+  const isLoggedIn = !!req.auth?.user;
+
+  // Seamless backwards compatibility: redirect /bugs and /bugs/* to /issues and /issues/*
+  if (pathWithoutBase === "/bugs" || pathWithoutBase.startsWith("/bugs/")) {
+    const newPath = pathWithoutBase.replace(/^\/bugs/, "/issues");
+    const targetUrl = new URL(
+      BASE_PATH ? `${BASE_PATH}${newPath}` : newPath,
+      req.nextUrl.origin,
+    );
+    targetUrl.search = req.nextUrl.search;
+    return NextResponse.redirect(targetUrl, 308);
+  }
+  if (pathWithoutBase.startsWith("/api/bugs/")) {
+    const newPath = pathWithoutBase.replace(/^\/api\/bugs\//, "/api/issues/");
+    const targetUrl = new URL(
+      BASE_PATH ? `${BASE_PATH}${newPath}` : newPath,
+      req.nextUrl.origin,
+    );
+    targetUrl.search = req.nextUrl.search;
+    return NextResponse.redirect(targetUrl, 308);
+  }
+
+  const isAuthPage =
+    pathWithoutBase.startsWith("/login") || pathWithoutBase.startsWith("/signup");
+  const isPublic = isPublicPath(pathWithoutBase, req.headers.get("user-agent"));
 
   if (!isLoggedIn && !isPublic) {
     const url = new URL(
       BASE_PATH ? `${BASE_PATH}/login` : "/login",
       req.nextUrl.origin,
     );
-    url.searchParams.set("callbackUrl", pathWithoutBase);
+    url.searchParams.set("callbackUrl", callbackPath(pathWithoutBase, req.nextUrl));
     return NextResponse.redirect(url);
   }
 
   // Allow reset links even when a session exists; only bounce login/signup.
   if (isLoggedIn && isAuthPage) {
     return NextResponse.redirect(
-      new URL(BASE_PATH ? `${BASE_PATH}/bugs` : "/bugs", req.nextUrl.origin),
+      new URL(BASE_PATH ? `${BASE_PATH}/issues` : "/issues", req.nextUrl.origin),
     );
   }
 
@@ -58,6 +104,14 @@ export default auth((req) => {
 
   return NextResponse.next();
 });
+
+/** Keeps the agent approval code across the sign-in redirect. Other queries stay off the callback. */
+function callbackPath(path: string, url: URL): string {
+  if (path !== "/settings/agents/pair") return path;
+  const code = url.searchParams.get("code") ?? "";
+  if (!/^[A-Za-z0-9-]{1,20}$/.test(code)) return path;
+  return `${path}?code=${code}`;
+}
 
 export const config = {
   matcher: ["/((?!api/auth|_next/static|_next/image|favicon.ico|.*\\..*).*)"],

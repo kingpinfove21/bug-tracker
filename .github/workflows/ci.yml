@@ -35,7 +35,7 @@ jobs:
       - name: Setup Node.js 20
         uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: "pnpm"
 
       - name: Install dependencies
@@ -50,9 +50,98 @@ jobs:
       - name: Test
         run: pnpm test
 
+      # packages/mcp-server is standalone (#612): its own dependencies and lockfile.
+      - name: MCP server (install, type check, test, build)
+        working-directory: packages/mcp-server
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm typecheck
+          pnpm test
+          pnpm build
+
       - name: Build
         env:
           DATABASE_URL: "postgresql://dummy:dummy@localhost:5432/dummy"
           AUTH_SECRET: "ci-build-secret-dummy-must-be-long-enough-32-chars"
           NEXTAUTH_URL: "http://localhost:3000"
         run: pnpm build
+
+  # #299: the critical paths in a real browser, at desktop and 375px, against
+  # a production build and a freshly migrated, seeded database.
+  e2e:
+    name: End-to-end (Playwright)
+    # Pinned: ubuntu-latest is moving to 26.04, where `playwright install
+    # chromium` fails ("does not support chromium on ubuntu26.04-x64").
+    # Go back to ubuntu-latest once Playwright supports it.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: bug_tracker_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      # The seed only wipes a database named for tests (e2e/seed.ts).
+      DATABASE_URL: "postgresql://postgres:postgres@localhost:5432/bug_tracker_e2e"
+      AUTH_SECRET: "ci-e2e-secret-dummy-must-be-long-enough-32-chars"
+      AUTH_URL: "http://localhost:3000/api/auth"
+      NEXTAUTH_URL: "http://localhost:3000"
+      SITE_URL_ALLOW_LOOPBACK: "true"
+      AUTH_TRUST_HOST: "true"
+      AUTH_PASSWORD_LOGIN: "true"
+      # The agent platform is on by default in production; run e2e against the
+      # real UI (#588) and give webhook signing a valid dummy 32-byte key.
+      AGENT_PLATFORM: "true"
+      NEXT_PUBLIC_AGENT_PLATFORM: "true"
+      WEBHOOK_SECRET_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.14.0
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: "pnpm"
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Install Chromium for Playwright
+        run: pnpm exec playwright install --with-deps chromium
+
+      - name: Migrate and seed a clean database
+        run: |
+          pnpm exec prisma migrate deploy
+          pnpm e2e:seed
+
+      - name: Build
+        run: pnpm build
+
+      - name: Run end-to-end tests
+        run: pnpm e2e
+
+      - name: Upload screenshots and traces
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-results
+          path: |
+            test-results/
+            playwright-report/
+          retention-days: 7

@@ -42,7 +42,7 @@ export function parseCommentTarget(raw: string | string[] | undefined): string |
  * the fragment scrolls to it.
  */
 export function commentPermalinkPath(bugId: string, commentId: string): string {
-  return `/bugs/${bugId}?${COMMENT_PARAM}=${encodeURIComponent(commentId)}#comment-${commentId}`;
+  return `/issues/${bugId}?${COMMENT_PARAM}=${encodeURIComponent(commentId)}#comment-${commentId}`;
 }
 
 type Db = Pick<PrismaClient, "comment"> | Pick<Prisma.TransactionClient, "comment">;
@@ -59,6 +59,7 @@ export type CommentWindow = {
 
 const commentInclude = {
   author: { select: { name: true, role: true, image: true } },
+  agent: { select: { name: true } },
   parent: {
     select: {
       id: true,

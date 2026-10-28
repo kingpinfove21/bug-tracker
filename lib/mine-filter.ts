@@ -1,20 +1,27 @@
 import type { Prisma } from "@prisma/client";
-import { DEFAULT_BUG_SORT, type BugSortOption } from "@/lib/bugs-sort";
+import { DEFAULT_BUG_SORT, type BugSortOption } from "@/lib/issues-sort";
 import { watchingWhere } from "@/lib/watching";
 
-/** "Show" filter on the issues list (#152), kept in the URL as `?mine=`. */
-export const MINE_FILTER_OPTIONS = ["assigned", "reported", "watching"] as const;
-export type MineFilter = (typeof MINE_FILTER_OPTIONS)[number];
+/** "Show" filter on the issues list (#152, #630), kept in the URL as `?mine=`. */
+export const MINE_FILTER_OPTIONS = [
+  "assigned",
+  "created",
+  "watching",
+] as const;
+export type MineFilter = (typeof MINE_FILTER_OPTIONS)[number] | "reported";
 
 export const mineFilterLabels: Record<MineFilter, string> = {
   assigned: "Assigned to me",
-  reported: "Reported by me",
+  created: "Created by me",
+  reported: "Created by me",
   watching: "Issues I'm watching",
 };
 
 export function parseMineFilter(raw?: string | string[] | null): MineFilter | null {
   const value = (Array.isArray(raw) ? raw[0] : raw)?.trim().toLowerCase();
-  return value && (MINE_FILTER_OPTIONS as readonly string[]).includes(value)
+  if (!value) return null;
+  if (value === "created" || value === "reported") return value as MineFilter;
+  return (MINE_FILTER_OPTIONS as readonly string[]).includes(value)
     ? (value as MineFilter)
     : null;
 }
@@ -26,7 +33,9 @@ export function mineFilterWhere(
 ): Prisma.BugWhereInput {
   if (!filter || !userId) return {};
   if (filter === "watching") return watchingWhere(userId);
-  return filter === "assigned" ? { assigneeId: userId } : { reporterId: userId };
+  if (filter === "assigned") return { assigneeId: userId };
+  if (filter === "created" || filter === "reported") return { reporterId: userId };
+  return {};
 }
 
 /**

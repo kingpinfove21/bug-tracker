@@ -1,3 +1,5 @@
+import { clearCommentDrafts } from "./comment-draft";
+
 export const DRAFT_PREFIX = "draft";
 export const DRAFT_MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000; // 7 days in ms
 
@@ -11,12 +13,18 @@ export function buildDraftKey(params: {
   formType: "create-bug" | "update-bug" | "comment";
   bugId?: string | null;
   parentId?: string | null;
+  projectId?: string | null;
 }): string {
   const userSegment = params.userId ? params.userId : "anon";
 
   switch (params.formType) {
     case "create-bug":
-      return `${DRAFT_PREFIX}:${userSegment}:bug:new`;
+      // Scoped to the active project so a draft never follows the person
+      // into a different project's form (#729); unscoped when the context
+      // is unknown, matching the historical key.
+      return params.projectId
+        ? `${DRAFT_PREFIX}:${userSegment}:bug:new:${params.projectId}`
+        : `${DRAFT_PREFIX}:${userSegment}:bug:new`;
     case "update-bug":
       return `${DRAFT_PREFIX}:${userSegment}:bug:${params.bugId ?? "unknown"}:update`;
     case "comment":
@@ -115,4 +123,9 @@ export function clearUserDrafts(userId?: string | null): void {
   } catch {
     // Ignore error
   }
+
+  // Comment drafts use their own prefix, so the loop above never saw them
+  // (#481). They are scoped per viewer as well; the unscoped leftovers from
+  // older builds go too, since they belong to nobody in particular.
+  clearCommentDrafts(window.localStorage, userId);
 }

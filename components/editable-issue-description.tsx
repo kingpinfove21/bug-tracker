@@ -2,7 +2,7 @@
 
 import { useState, useTransition, type ReactNode } from "react";
 import { useRouter } from "next/navigation";
-import { editBugContentAction } from "@/app/actions/bugs";
+import { editBugContentAction } from "@/app/actions/issues";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { MarkdownEditor } from "@/components/markdown-editor";
@@ -10,6 +10,7 @@ import { RichText } from "@/components/rich-text";
 import { MentionText } from "@/components/comment-body";
 import Link from "next/link";
 import { LocalTime } from "@/components/local-time";
+import { ExpandableText } from "@/components/expandable-text";
 
 export type EditableIssueDescriptionProps = {
   bugId: string;
@@ -21,6 +22,8 @@ export type EditableIssueDescriptionProps = {
   /** When the title or description was last edited (#303); null if never. */
   lastEditedAt?: Date | null;
   historyHref?: string;
+  /** When the issue was created (#422); shown on the heading row. */
+  createdAt?: Date | string | null;
 };
 
 export function EditableIssueDescription({
@@ -32,11 +35,13 @@ export function EditableIssueDescription({
   children,
   lastEditedAt = null,
   historyHref,
+  createdAt = null,
 }: EditableIssueDescriptionProps) {
   const router = useRouter();
   const [isEditing, setIsEditing] = useState(false);
   const [title, setTitle] = useState(initialTitle);
   const [description, setDescription] = useState(initialDescription);
+  const [editorUploading, setEditorUploading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [pending, startTransition] = useTransition();
 
@@ -56,6 +61,7 @@ export function EditableIssueDescription({
 
   const handleSave = (e: React.FormEvent) => {
     e.preventDefault();
+    if (pending || editorUploading) return;
     setError(null);
 
     const formData = new FormData();
@@ -77,7 +83,7 @@ export function EditableIssueDescription({
 
   return (
     <section className="rounded-xl border border-slate-200 bg-white p-4 sm:p-6">
-      <div className="flex items-center justify-between gap-3">
+      <div className="flex flex-wrap items-center justify-between gap-x-3 gap-y-2">
         <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
           <h2 className="text-sm font-semibold uppercase tracking-wide text-slate-500">
             {isEditing ? "Edit issue" : "Description"}
@@ -91,15 +97,23 @@ export function EditableIssueDescription({
             </p>
           ) : null}
         </div>
-        {canEdit && !isEditing ? (
-          <Button
-            variant="ghost"
-            className="px-2.5 py-1 text-xs text-slate-600 hover:text-slate-900"
-            onClick={handleStartEdit}
-          >
-            Edit
-          </Button>
-        ) : null}
+        <div className="ml-auto flex items-center gap-2">
+          {!isEditing && createdAt ? (
+            <p className="text-xs text-slate-500">
+              <span className="sr-only">Created </span>
+              <LocalTime date={createdAt} />
+            </p>
+          ) : null}
+          {canEdit && !isEditing ? (
+            <Button
+              variant="ghost"
+              className="px-2.5 py-1 text-xs text-slate-600 hover:text-slate-900"
+              onClick={handleStartEdit}
+            >
+              Edit
+            </Button>
+          ) : null}
+        </div>
       </div>
 
       {isEditing ? (
@@ -147,6 +161,7 @@ export function EditableIssueDescription({
               name="description"
               value={description}
               onChange={setDescription}
+              onUploadingChange={setEditorUploading}
               users={mentionUsers}
               minLength={10}
               maxLength={5000}
@@ -161,11 +176,12 @@ export function EditableIssueDescription({
               type="submit"
               disabled={
                 pending ||
+                editorUploading ||
                 title.trim().length < 3 ||
                 description.trim().length < 10
               }
             >
-              {pending ? "Saving…" : "Save"}
+              {pending ? "Saving…" : editorUploading ? "Uploading…" : "Save"}
             </Button>
             <Button
               type="button"
@@ -178,11 +194,13 @@ export function EditableIssueDescription({
           </div>
         </form>
       ) : (
-        <div className="mt-2">
-          <RichText
-            content={initialDescription}
-            renderMentions={(text) => <MentionText text={text} users={users} />}
-          />
+        <div className="mt-2 max-w-3xl">
+          <ExpandableText maxLines={6} expandText="View more" collapseText="View less">
+            <RichText
+              content={initialDescription}
+              renderMentions={(text) => <MentionText text={text} users={users} />}
+            />
+          </ExpandableText>
         </div>
       )}
 

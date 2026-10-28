@@ -5,6 +5,7 @@ import { BASE_PATH } from "@/lib/base-path";
 import {
   ATTACHMENT_ACCEPT,
   ATTACHMENT_HELP,
+  MAX_ATTACHMENT_BYTES,
   MAX_ATTACHMENTS_PER_ITEM,
   formatBytes,
 } from "@/lib/attachments";
@@ -21,10 +22,12 @@ type Item =
 export function AttachmentPicker({
   name = "attachmentIds",
   onChange,
+  onUploadingChange,
   disabled = false,
 }: {
   name?: string;
   onChange?: (ids: string[]) => void;
+  onUploadingChange?: (uploading: boolean) => void;
   disabled?: boolean;
 }) {
   const inputId = useId();
@@ -34,6 +37,8 @@ export function AttachmentPicker({
 
   const doneIds = (list: Item[]) =>
     list.flatMap((item) => (item.state === "done" ? [item.id] : []));
+
+  const isUploading = items.some((item) => item.state === "uploading");
 
   const update = (fn: (list: Item[]) => Item[]) => setItems(fn);
 
@@ -46,6 +51,19 @@ export function AttachmentPicker({
   useEffect(() => {
     onChangeRef.current?.(idsKey ? idsKey.split(",") : []);
   }, [idsKey]);
+
+  const onUploadingChangeRef = useRef(onUploadingChange);
+  useEffect(() => {
+    onUploadingChangeRef.current = onUploadingChange;
+  });
+  useEffect(() => {
+    onUploadingChangeRef.current?.(isUploading);
+    return () => {
+      if (isUploading) {
+        onUploadingChangeRef.current?.(false);
+      }
+    };
+  }, [isUploading]);
 
   async function upload(file: File, key: string) {
     const body = new FormData();
@@ -81,8 +99,17 @@ export function AttachmentPicker({
       file,
       key: `${file.name}-${file.size}-${Math.random().toString(36).slice(2)}`,
     }));
-    update((list) => [...list, ...added.map(({ file, key }) => ({ key, name: file.name, state: "uploading" as const }))]);
-    added.forEach(({ file, key }) => void upload(file, key));
+    update((list) => [
+      ...list,
+      ...added.map(({ file, key }) =>
+        file.size > MAX_ATTACHMENT_BYTES
+          ? { key, name: file.name, state: "error" as const, error: "File is too large (max 5 MB)." }
+          : { key, name: file.name, state: "uploading" as const },
+      ),
+    ]);
+    added
+      .filter(({ file }) => file.size <= MAX_ATTACHMENT_BYTES)
+      .forEach(({ file, key }) => void upload(file, key));
     if (inputRef.current) inputRef.current.value = "";
   }
 

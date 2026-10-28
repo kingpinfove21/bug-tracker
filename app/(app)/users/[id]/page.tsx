@@ -2,13 +2,24 @@ import Link from "next/link";
 import type { Metadata } from "next";
 import { notFound } from "next/navigation";
 import { prisma } from "@/lib/prisma";
+import { bugInTenant, currentTenantIdFor } from "@/lib/tenant-context";
+import { pointTotals } from "@/lib/points/leaderboard";
+import { pointBalance } from "@/lib/points/balance";
+import { decodePointCursor, pointEntries, pointEntriesQuerySchema } from "@/lib/points/entries";
+import { PointsLedger } from "@/components/points-ledger";
+import { PointsSummary } from "@/components/points-summary";
 import { requireUser } from "@/lib/auth-helpers";
+import { canViewProfile, canViewWallet } from "@/lib/profile-access";
 import { roleLabels } from "@/lib/roles";
 import { Badge } from "@/components/ui/badge";
 import { LocalTime } from "@/components/local-time";
 import { statusClass, statusLabels } from "@/lib/labels";
+import { teamAgentsForMember } from "@/lib/team-directory";
+import { TeamAgentList } from "@/components/team-agent-list";
+import { isTenantAdmin } from "@/lib/agents/membership";
+import { settableLevels } from "@/lib/agents/levels";
 
-type ProfileProps = { params: Promise<{ id: string }> };
+type ProfileProps = { params: Promise<{ id: string }>; searchParams?: Promise<Record<string, string | string[] | undefined>> };
 
 /** How many of each list to show before pointing at the filtered list. */
 const RECENT = 10;
@@ -23,57 +34,97 @@ export async function generateMetadata({
   params,
 }: ProfileProps): Promise<Metadata> {
   const { id } = await params;
-  const user = await prisma.user.findUnique({
-    where: { id },
-    select: { name: true },
-  });
+  const viewer = await requireUser();
+  // #503: the name is in the tab title, so it gets the same check as the page.
+  const user = (await canViewProfile(prisma, viewer, id))
+    ? await prisma.user.findUnique({ where: { id }, select: { name: true } })
+    : null;
   return {
     title: user ? user.name : "Person not found",
     robots: { index: false, follow: false },
   };
 }
 
-export default async function ProfilePage({ params }: ProfileProps) {
-  await requireUser();
+export default async function ProfilePage({ params, searchParams }: ProfileProps) {
+  const viewer = await requireUser();
   const { id } = await params;
+  // #503: only people who share a tenant with this person can see them.
+  if (!(await canViewProfile(prisma, viewer, id))) notFound();
+  // #428: points in the viewer's tenant.
+  const tenantId = await currentTenantIdFor(viewer.id);
+  // #425, #439: a profile is another way to read issues. No membership, no issues.
+  const scope = bugInTenant(tenantId);
 
   const [person, reported, assigned, counts, assignedTotal] = await Promise.all([
     prisma.user.findUnique({
       where: { id },
-      select: { id: true, name: true, role: true, createdAt: true },
+      select: { id: true, name: true, role: true, createdAt: true, walletAddress: true },
     }),
     prisma.bug.findMany({
-      where: { reporterId: id, isDeleted: false },
+      where: { reporterId: id, isDeleted: false, ...scope },
       select: { id: true, title: true, status: true, createdAt: true },
       orderBy: { createdAt: "desc" },
       take: RECENT,
     }),
     prisma.bug.findMany({
-      where: { assigneeId: id, isDeleted: false },
+      where: { assigneeId: id, isDeleted: false, ...scope },
       select: { id: true, title: true, status: true, updatedAt: true },
       orderBy: { updatedAt: "desc" },
       take: RECENT,
     }),
     prisma.bug.groupBy({
       by: ["status"],
-      where: { reporterId: id, isDeleted: false },
+      where: { reporterId: id, isDeleted: false, ...scope },
       _count: { _all: true },
     }),
     // Counted rather than taken from `assigned.length`, which stops at RECENT
     // and would quietly under-report anyone with more than that.
-    prisma.bug.count({ where: { assigneeId: id, isDeleted: false } }),
+    prisma.bug.count({ where: { assigneeId: id, isDeleted: false, ...scope } }),
   ]);
 
   if (!person) notFound();
 
+  const points = tenantId
+    ? await pointTotals(prisma, tenantId, person.id)
+    : { points: 0, solvedTasks: 0 };
+  // #618: the ledger balance behind those points, and the wallet address that
+  // only they and workspace admins may see.
+  const [balance, walletVisible] = await Promise.all([
+    tenantId ? pointBalance(prisma, { tenantId, userId: person.id }) : Promise.resolve(null),
+    canViewWallet(prisma, viewer, person.id, tenantId),
+  ]);
+
+  const ledgerParams = await searchParams ?? {};
+  const ledgerQuery = pointEntriesQuerySchema.safeParse({
+    from: ledgerParams.from || undefined, to: ledgerParams.to || undefined, cursor: ledgerParams.cursor || undefined,
+  });
+  let ledgerError = !ledgerQuery.success;
+  if (ledgerQuery.success && ledgerQuery.data.cursor) {
+    try { decodePointCursor(ledgerQuery.data.cursor); } catch { ledgerError = true; }
+  }
+  const ledger = tenantId && viewer.id === person.id && ledgerQuery.success && !ledgerError
+    ? await pointEntries(prisma, { tenantId, userId: person.id }, ledgerQuery.data) : null;
+
   const reportedTotal = counts.reduce((sum, row) => sum + row._count._all, 0);
   const resolved =
     counts.find((row) => row.status === "resolved")?._count._all ?? 0;
+  const tenantMembership = tenantId
+    ? await prisma.membership.findFirst({
+        where: { tenantId, userId: person.id },
+        select: { id: true },
+      })
+    : null;
+  const agents = tenantId && tenantMembership
+    ? await teamAgentsForMember(prisma, tenantId, person.id)
+    : [];
+  const manageLevels = tenantId && viewer.id !== person.id && (await isTenantAdmin(viewer, tenantId))
+    ? settableLevels({ isOwner: false, isTenantAdmin: true })
+    : null;
 
   return (
     <div className="space-y-6">
       <div className="space-y-1">
-        <Link href="/bugs" className="text-sm text-teal-700 hover:underline">
+        <Link href="/issues" className="text-sm text-teal-700 hover:underline">
           ← Back to issues
         </Link>
         <h1 className="flex flex-wrap items-center gap-2 text-2xl font-semibold text-slate-900">
@@ -92,6 +143,53 @@ export default async function ProfilePage({ params }: ProfileProps) {
         <Stat label="Of those, resolved" value={resolved} />
         <Stat label="Currently assigned" value={assignedTotal} />
       </dl>
+
+      <PointsSummary points={points.points} solvedTasks={points.solvedTasks} />
+
+      {balance || (walletVisible && person.walletAddress) ? (
+        <section
+          className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5"
+          aria-labelledby="balance-heading"
+        >
+          <h2
+            id="balance-heading"
+            className="text-sm font-semibold uppercase tracking-wide text-slate-500"
+          >
+            Balance
+          </h2>
+          {balance ? (
+            <>
+              <p className="mt-1 text-2xl font-semibold tabular-nums text-slate-900">
+                {balance.lifetime.points}
+                <span className="ml-1 text-sm font-normal text-slate-600">
+                  point{balance.lifetime.points === 1 ? "" : "s"}
+                </span>
+              </p>
+              <p className="text-sm text-slate-600">
+                {balance.lifetime.entries} ledger entr
+                {balance.lifetime.entries === 1 ? "y" : "ies"}, corrections included
+              </p>
+            </>
+          ) : null}
+          {walletVisible && person.walletAddress ? (
+            <p className="mt-2 break-all font-mono text-sm text-slate-700">
+              <span className="font-sans font-medium text-slate-600">Wallet </span>
+              {person.walletAddress}
+            </p>
+          ) : null}
+        </section>
+      ) : null}
+
+      {tenantId && viewer.id === person.id ? (
+        <PointsLedger page={ledger} profileId={person.id} from={ledgerQuery.success ? ledgerQuery.data.from : undefined} to={ledgerQuery.success ? ledgerQuery.data.to : undefined} error={ledgerError} />
+      ) : null}
+
+      <section className="rounded-xl border border-slate-200 bg-white p-4 sm:p-5" aria-labelledby="profile-agents-heading">
+        <h2 id="profile-agents-heading" className="text-sm font-semibold uppercase tracking-wide text-slate-500">
+          Agents
+        </h2>
+        <TeamAgentList agents={agents} manageLevels={manageLevels} />
+      </section>
 
       <IssueList
         heading="Reported"
@@ -156,7 +254,7 @@ function IssueList({
           {issues.map((issue) => (
             <li key={issue.id}>
               <Link
-                href={`/bugs/${issue.id}`}
+                href={`/issues/${issue.id}`}
                 className="flex flex-wrap items-center gap-x-3 gap-y-1 px-4 py-3 text-sm transition hover:bg-slate-50"
               >
                 <span className="min-w-0 flex-1 break-words font-medium text-slate-900">

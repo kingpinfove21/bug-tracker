@@ -1,31 +1,65 @@
 import { describe, expect, it } from "vitest";
 import {
+  SWITCH_TENANT_LINK,
   headerNavItems,
   initialsOf,
   isNavItemActive,
   realRoleOf,
 } from "./header-nav";
 
-describe("headerNavItems", () => {
-  it("shows Issues and Milestones to normal users", () => {
-    expect(headerNavItems("user").map((i) => i.label)).toEqual(["Issues", "Milestones"]);
+describe("SWITCH_TENANT_LINK (#444)", () => {
+  it("goes to the tenant picker, and is marked current on it and its pages", () => {
+    expect(SWITCH_TENANT_LINK).toEqual({ href: "/tenants", label: "Switch workspace" });
+    expect(isNavItemActive("/tenants", SWITCH_TENANT_LINK.href)).toBe(true);
+    expect(isNavItemActive("/tenants/acme", SWITCH_TENANT_LINK.href)).toBe(true);
+    expect(isNavItemActive("/issues", SWITCH_TENANT_LINK.href)).toBe(false);
   });
 
-  it("adds Platforms and Types for admins", () => {
-    expect(headerNavItems("admin").map((i) => i.label)).toEqual([
+  it("stays out of the main nav, which is unchanged", () => {
+    for (const role of ["user", "admin", "super_admin"] as const) {
+      expect(headerNavItems(role).map((i) => i.href)).not.toContain("/tenants");
+    }
+  });
+});
+
+describe("headerNavItems (#761)", () => {
+  it("shows Issues and Escalations to normal users; Team moved to Settings (#423)", () => {
+    const items = headerNavItems("user");
+    expect(items.map((i) => i.label)).toEqual(["Issues", "Escalations"]);
+    expect(items.map((i) => i.href)).not.toContain("/team");
+    expect(items.map((i) => i.label)).not.toContain("Workspace");
+    expect(items.find((i) => i.label === "Escalations")?.children).toBeUndefined();
+  });
+
+  it("shows API Docs on the bar when the agent platform is explicitly disabled", () => {
+    expect(headerNavItems("user", { agentPlatform: false }).map((i) => i.label)).toEqual([
       "Issues",
-      "Milestones",
-      "Platforms",
-      "Types",
+      "API Docs",
     ]);
   });
 
-  it("adds Admins for super admins", () => {
+  it("links Escalations directly when the agent platform is enabled (#627)", () => {
+    const item = headerNavItems("user", { agentPlatform: true }).find((i) => i.label === "Escalations");
+    expect(item?.href).toBe("/escalations");
+    expect(item?.children).toBeUndefined();
+  });
+
+  it("includes pending escalations badge count when provided (#763)", () => {
+    const item = headerNavItems("user", { agentPlatform: true, pendingEscalations: 3 }).find(
+      (i) => i.label === "Escalations",
+    );
+    expect(item?.badge).toBe(3);
+
+    const quiet = headerNavItems("user", { agentPlatform: true, pendingEscalations: 0 }).find(
+      (i) => i.label === "Escalations",
+    );
+    expect(quiet?.badge).toBeUndefined();
+  });
+
+  it("adds Admins for super admins (#761)", () => {
     expect(headerNavItems("super_admin").map((i) => i.label)).toEqual([
       "Issues",
-      "Milestones",
-      "Platforms",
-      "Types",
+      "Escalations",
       "Admins",
     ]);
   });
@@ -33,10 +67,12 @@ describe("headerNavItems", () => {
 
 describe("isNavItemActive", () => {
   it("marks Issues active on the list and on an issue, not on the new-issue form", () => {
-    expect(isNavItemActive("/bugs", "/bugs")).toBe(true);
-    expect(isNavItemActive("/bugs/", "/bugs")).toBe(true);
-    expect(isNavItemActive("/bugs/abc123", "/bugs")).toBe(true);
-    expect(isNavItemActive("/bugs/new", "/bugs")).toBe(false);
+    expect(isNavItemActive("/issues", "/issues")).toBe(true);
+    expect(isNavItemActive("/issues/", "/issues")).toBe(true);
+    expect(isNavItemActive("/issues/abc123", "/issues")).toBe(true);
+    expect(isNavItemActive("/issues/new", "/issues")).toBe(false);
+    expect(isNavItemActive("/bugs", "/issues")).toBe(true);
+    expect(isNavItemActive("/bugs/abc123", "/issues")).toBe(true);
   });
 
   it("matches admin pages by prefix only on a path boundary", () => {
@@ -44,7 +80,28 @@ describe("isNavItemActive", () => {
     expect(isNavItemActive("/admin/types/x", "/admin/types")).toBe(true);
     expect(isNavItemActive("/admin/typesx", "/admin/types")).toBe(false);
     expect(isNavItemActive("/settings", "/admin/types")).toBe(false);
-    expect(isNavItemActive(null, "/bugs")).toBe(false);
+    expect(isNavItemActive(null, "/issues")).toBe(false);
+  });
+
+  it("marks Escalations active for /escalations and legacy /questions (#763)", () => {
+    expect(isNavItemActive("/escalations", "/escalations")).toBe(true);
+    expect(isNavItemActive("/escalations/q1", "/escalations")).toBe(true);
+    expect(isNavItemActive("/questions", "/escalations")).toBe(true);
+    expect(isNavItemActive("/questions/q1", "/escalations")).toBe(true);
+    expect(isNavItemActive("/redesigns", "/escalations")).toBe(true);
+    expect(isNavItemActive("/redesigns/r1", "/escalations")).toBe(true);
+    expect(isNavItemActive("/issues", "/escalations")).toBe(false);
+  });
+
+  it("marks Manage Workspace active on grouped sub-routes (#761)", () => {
+    expect(isNavItemActive("/projects", "/manage-project")).toBe(true);
+    expect(isNavItemActive("/projects/p1", "/manage-project")).toBe(true);
+    expect(isNavItemActive("/milestones", "/manage-project")).toBe(true);
+    expect(isNavItemActive("/milestones/m1", "/manage-project")).toBe(true);
+    expect(isNavItemActive("/admin/categories", "/manage-project")).toBe(true);
+    expect(isNavItemActive("/admin/types", "/manage-project")).toBe(true);
+    expect(isNavItemActive("/issues", "/manage-project")).toBe(false);
+    expect(isNavItemActive("/escalations", "/manage-project")).toBe(false);
   });
 });
 

@@ -2,13 +2,30 @@ import type { NextConfig } from "next";
 import { BASE_PATH } from "./lib/base-path";
 
 const nextConfig: NextConfig = {
+  // #585: the production image ships only the traced standalone server.
+  output: "standalone",
   ...(BASE_PATH ? { basePath: BASE_PATH } : {}),
+  images: {
+    remotePatterns: [
+      {
+        protocol: "https",
+        hostname: "lh3.googleusercontent.com",
+      },
+      {
+        protocol: "https",
+        hostname: "avatars.githubusercontent.com",
+      },
+    ],
+  },
   env: {
     NEXTAUTH_URL:
       process.env.NEXTAUTH_URL ||
       (BASE_PATH
         ? `https://contributors.zedu.chat${BASE_PATH}/api/auth`
-        : "https://issues.zedu.chat/api/auth"),
+        : "https://ziki.dev/api/auth"),
+  },
+  outputFileTracingIncludes: {
+    "/llms.txt": ["./docs/ziki-for-agents.md"],
   },
   async headers() {
     // #222: the app previously sent no security headers at all, which left
@@ -52,8 +69,36 @@ const nextConfig: NextConfig = {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
   async redirects() {
+    const list = [
+      {
+        source: "/bugs",
+        destination: "/issues",
+        permanent: true,
+      },
+      {
+        source: "/bugs/:path*",
+        destination: "/issues/:path*",
+        permanent: true,
+      },
+      {
+        source: "/questions",
+        destination: "/escalations",
+        permanent: true,
+      },
+      {
+        source: "/questions/:path*",
+        destination: "/escalations/:path*",
+        permanent: true,
+      },
+      {
+        source: "/api/bugs/:path*",
+        destination: "/api/issues/:path*",
+        permanent: true,
+      },
+    ];
     if (!BASE_PATH) {
       return [
+        ...list,
         {
           source: "/bug-tracker",
           destination: "/",
@@ -66,7 +111,11 @@ const nextConfig: NextConfig = {
         },
       ];
     }
-    return [];
+    return list;
+  },
+  experimental: {
+    // #447: lets a page answer 403 with `forbidden()` and app/forbidden.tsx.
+    authInterrupts: true,
   },
   turbopack: {
     rules: {

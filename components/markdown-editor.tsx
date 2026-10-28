@@ -3,12 +3,14 @@
 import {
   forwardRef,
   useCallback,
+  useEffect,
   useId,
   useImperativeHandle,
   useRef,
   useState,
   useSyncExternalStore,
   type ClipboardEvent,
+  type DragEvent,
   type FormEvent,
   type KeyboardEvent,
   type MouseEvent,
@@ -16,6 +18,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Textarea } from "@/components/ui/textarea";
+import { CharacterCounter } from "@/components/ui/character-counter";
 import { RichText } from "@/components/rich-text";
 import {
   BoldIcon,
@@ -31,6 +34,7 @@ import {
   StrikethroughIcon,
   TaskListIcon,
 } from "@/components/editor-icons";
+import { AgentMentionBadge } from "@/components/comment-body";
 import {
   useMentionSuggestions,
   type MentionUser,
@@ -43,6 +47,15 @@ import {
   type FormatAction,
 } from "@/lib/markdown-toolbar";
 import { applyTextChange } from "@/lib/editor-dom";
+import { MAX_ATTACHMENT_BYTES, formatBytes } from "@/lib/attachments";
+import {
+  filesFrom,
+  isFileDrag,
+  markdownFor,
+  nameForPasted,
+  placeholderFor,
+  replacePlaceholder,
+} from "@/lib/editor-upload";
 
 export type MarkdownEditorHandle = {
   focus: () => void;
@@ -67,20 +80,21 @@ const WRITE_TOOLS: ToolbarButtonSpec[] = [
   { action: "italic", label: "Italic", icon: <ItalicIcon /> },
   // Strikethrough: S crossed by a horizontal line.
   { action: "strikethrough", label: "Strikethrough", icon: <StrikethroughIcon /> },
-  // Heading levels use their explicit H1, H2, and H3 labels.
+  // Heading levels use their explicit H1, H2, and H3 labels, so the visible
+  // text stays inside the accessible name (WCAG 2.5.3).
   {
     action: "heading1",
-    label: "Heading 1",
+    label: "H1",
     icon: <span className="text-xs font-bold leading-none">H1</span>,
   },
   {
     action: "heading2",
-    label: "Heading 2",
+    label: "H2",
     icon: <span className="text-xs font-bold leading-none">H2</span>,
   },
   {
     action: "heading3",
-    label: "Heading 3",
+    label: "H3",
     icon: <span className="text-xs font-bold leading-none">H3</span>,
   },
   // Quote: paired quotation marks.
@@ -124,6 +138,7 @@ export type MarkdownEditorProps = {
    * is named by a visible label rather than by `aria-label`.
    */
   labelId?: string;
+  onUploadingChange?: (uploading: boolean) => void;
 } & Omit<
   TextareaHTMLAttributes<HTMLTextAreaElement>,
   "value" | "onChange" | "children"
@@ -154,7 +169,7 @@ function ToolbarButton({
       // fire click, not mousedown) works too.
       onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
-      className="rounded p-2 text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40 sm:p-1.5"
+      className="inline-flex h-9 w-9 shrink-0 items-center justify-center rounded text-slate-600 transition hover:bg-slate-100 hover:text-slate-900 disabled:cursor-not-allowed disabled:opacity-40 sm:h-7 sm:w-7 [@media(pointer:coarse)]:h-9 [@media(pointer:coarse)]:w-9 sm:[@media(pointer:fine)]:h-7 sm:[@media(pointer:fine)]:w-7"
     >
       <span className="flex h-4 w-4 shrink-0 items-center justify-center">
         {icon}
@@ -196,6 +211,7 @@ export const MarkdownEditor = forwardRef<
     onBlur,
     onInvalid,
     labelId,
+    onUploadingChange,
     ...rest
   },
   ref,
@@ -205,6 +221,60 @@ export const MarkdownEditor = forwardRef<
   const listboxId = `${fieldId}-mention-listbox`;
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [tab, setTab] = useState<EditorTab>("write");
+  // #305: uploads finish after the person has kept typing, so they patch
+  // the latest text, not the text from when they started.
+  const valueRef = useRef(value);
+  const onChangeRef = useRef(onChange);
+  useEffect(() => {
+    valueRef.current = value;
+    onChangeRef.current = onChange;
+  });
+  const [uploading, setUploading] = useState(0);
+  const onUploadingChangeRef = useRef(onUploadingChange);
+  useEffect(() => {
+    onUploadingChangeRef.current = onUploadingChange;
+  });
+  useEffect(() => {
+    const isUploading = uploading > 0;
+    onUploadingChangeRef.current?.(isUploading);
+    return () => {
+      if (isUploading) {
+        onUploadingChangeRef.current?.(false);
+      }
+    };
+  }, [uploading]);
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [dragging, setDragging] = useState(false);
+  const toolbarRef = useRef<HTMLDivElement>(null);
+  const [canScrollLeft, setCanScrollLeft] = useState(false);
+  const [canScrollRight, setCanScrollRight] = useState(false);
+
+  const checkScroll = useCallback(() => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    const { scrollLeft, scrollWidth, clientWidth } = el;
+    setCanScrollLeft(scrollLeft > 2);
+    setCanScrollRight(scrollWidth - clientWidth - scrollLeft > 2);
+  }, []);
+
+  useEffect(() => {
+    const el = toolbarRef.current;
+    if (!el) return;
+    checkScroll();
+    const handleResize = () => checkScroll();
+    window.addEventListener("resize", handleResize);
+    if (typeof ResizeObserver !== "undefined") {
+      const ro = new ResizeObserver(() => checkScroll());
+      ro.observe(el);
+      return () => {
+        window.removeEventListener("resize", handleResize);
+        ro.disconnect();
+      };
+    }
+    return () => {
+      window.removeEventListener("resize", handleResize);
+    };
+  }, [checkScroll, users]);
   // `false` on the server so the first client render matches the server HTML.
   const isApple = useSyncExternalStore(
     subscribeToNothing,
@@ -283,7 +353,11 @@ export const MarkdownEditor = forwardRef<
   );
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (disabled) {
+    if (
+      disabled ||
+      event.nativeEvent.isComposing ||
+      event.nativeEvent.keyCode === 229
+    ) {
       onKeyDown?.(event);
       return;
     }
@@ -323,11 +397,131 @@ export const MarkdownEditor = forwardRef<
     onKeyDown?.(event);
   };
 
+  /**
+   * #305: upload pasted or dropped files. A placeholder goes in at the caret
+   * straight away and is swapped for the real Markdown, or removed with a
+   * message if the upload fails, so no broken image is ever left behind.
+   */
+  const uploadFiles = (files: File[], pasted: boolean) => {
+    if (files.length === 0 || disabled) return;
+    setUploadError(null);
+    const tooLarge = files.filter((file) => file.size > MAX_ATTACHMENT_BYTES);
+    if (tooLarge.length) {
+      setUploadError(
+        tooLarge
+          .map(
+            (file) =>
+              `${file.name}: ${formatBytes(file.size)} is over the ${formatBytes(MAX_ATTACHMENT_BYTES)} limit`,
+          )
+          .join(" "),
+      );
+    }
+    const valid = files.filter((file) => file.size <= MAX_ATTACHMENT_BYTES);
+    if (valid.length === 0) return;
+    const jobs = valid.map((file) => ({
+      file,
+      name: pasted ? nameForPasted(file) : file.name,
+      token: Math.random().toString(36).slice(2, 10),
+    }));
+    const textarea = textareaRef.current;
+    // Each file on its own line, like GitHub, so two never run together.
+    const caret = textarea?.selectionStart ?? value.length;
+    const before = caret > 0 && value[caret - 1] !== "\n" ? "\n" : "";
+    const text = before + jobs.map((j) => placeholderFor(j.token, j.name)).join("\n");
+    const selected = textarea ? (textarea.selectionEnd ?? 0) - (textarea.selectionStart ?? 0) : 0;
+    if (maxLength && value.length - selected + text.length > maxLength) {
+      setUploadError("There isn't room left in this field for another file.");
+      return;
+    }
+    setTab("write");
+    insertAtCaret(text);
+
+    for (const job of jobs) {
+      setUploading((n) => n + 1);
+      const body = new FormData();
+      body.set("file", job.file, job.name);
+      void fetch("/api/uploads", { method: "POST", body })
+        .then(async (res) => {
+          const data = (await res.json().catch(() => ({}))) as {
+            id?: string;
+            filename?: string;
+            contentType?: string;
+            error?: string;
+          };
+          if (!res.ok || !data.id) throw new Error(data.error || "The upload failed. Try again.");
+          return markdownFor(
+            { filename: data.filename ?? job.name, contentType: data.contentType ?? job.file.type },
+            data.id,
+          );
+        })
+        .then(
+          (markdown) => ({ markdown, error: null as string | null }),
+          (error: unknown) => ({
+            markdown: "",
+            error: `${job.name}: ${error instanceof Error ? error.message : "The upload failed."}`,
+          }),
+        )
+        .then(({ markdown, error }) => {
+          const current = valueRef.current;
+          let next = replacePlaceholder(current, job.token, markdown);
+          // #732: the finished Markdown (attachment URL included) is longer
+          // than the placeholder it replaced, so the insert-time check above
+          // can pass and the field still land over its limit. Never go over
+          // silently: drop the swap the way a failed upload is dropped, and
+          // say why, so the field stays valid and room can be made to try
+          // the upload again.
+          if (next !== null && maxLength !== undefined && next.length > maxLength) {
+            setUploadError(
+              `${job.name}: there isn't room left in this field for the finished upload. Remove something and try again.`,
+            );
+            next = replacePlaceholder(current, job.token, "");
+          }
+          if (next !== null) {
+            valueRef.current = next;
+            onChangeRef.current(next);
+          }
+          if (error) setUploadError(error);
+          setUploading((n) => n - 1);
+        });
+    }
+  };
+
+  const handleDragOver = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event.dataTransfer?.types)) return;
+    // Without this the browser opens the dropped file and the draft is lost.
+    event.preventDefault();
+    event.dataTransfer.dropEffect = disabled ? "none" : "copy";
+    if (!disabled) setDragging(true);
+  };
+
+  const handleDragLeave = (event: DragEvent<HTMLDivElement>) => {
+    const to = event.relatedTarget as Node | null;
+    if (!to || !event.currentTarget.contains(to)) setDragging(false);
+  };
+
+  const handleDrop = (event: DragEvent<HTMLDivElement>) => {
+    if (!isFileDrag(event.dataTransfer?.types)) return;
+    event.preventDefault();
+    setDragging(false);
+    if (disabled) return;
+    textareaRef.current?.focus();
+    uploadFiles(filesFrom(event.dataTransfer), false);
+  };
+
   const handlePaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
     onPaste?.(event);
     if (disabled) return;
     const clipboard = event.clipboardData;
     if (!clipboard) return;
+
+    // A screenshot (or a file copied in the file manager) comes as files;
+    // that wins over any text/HTML description of it.
+    const files = filesFrom(clipboard);
+    if (files.length > 0) {
+      event.preventDefault();
+      uploadFiles(files, true);
+      return;
+    }
 
     const markdown = pasteToMarkdown({
       text: clipboard.getData("text/plain"),
@@ -349,12 +543,19 @@ export const MarkdownEditor = forwardRef<
           rendered outside the shell - typing "@a" showed no dropdown at all.
           The shell must not clip. Rounded corners are preserved by clipping
           the toolbar row itself, which is the only child that needs it. */}
-      <div className="rounded-lg border border-slate-300 bg-white shadow-sm focus-within:border-teal-600 focus-within:ring-2 focus-within:ring-teal-600/20">
-        <div className="flex flex-wrap items-center gap-1 overflow-hidden rounded-t-lg border-b border-slate-200 bg-slate-50 px-1.5 py-1">
+      <div
+        className={`rounded-lg border bg-white shadow-sm focus-within:border-teal-600 focus-within:ring-2 focus-within:ring-teal-600/20 ${
+          dragging ? "border-teal-600 ring-2 ring-teal-600/30" : "border-slate-300"
+        }`}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+      >
+        <div className="flex flex-nowrap items-center gap-1 overflow-hidden rounded-t-lg border-b border-slate-200 bg-slate-50 px-1.5 py-1 sm:flex-wrap">
           <div
-            className="flex items-center gap-1 border-r border-slate-200 pr-1.5"
-            role="tablist"
-            aria-label="Editor mode"
+            className="flex shrink-0 items-center gap-1 border-r border-slate-200 pr-1.5"
+            role="group"
+            aria-label="Editor view"
           >
             <TabButton
               active={writing}
@@ -374,31 +575,50 @@ export const MarkdownEditor = forwardRef<
             </TabButton>
           </div>
 
-          <div
-            className="flex flex-wrap items-center gap-0.5"
-            role="toolbar"
-            aria-label="Formatting"
-          >
-            {WRITE_TOOLS.map((tool) => (
-              <ToolbarButton
-                key={tool.label}
-                label={tool.label}
-                shortcut={shortcutLabelFor(tool.action, isApple)}
-                disabled={disabled}
-                icon={tool.icon}
-                onClick={() => applyAction(tool.action as FormatAction)}
+          <div className="relative min-w-0 flex-1 sm:flex-initial">
+            <div
+              ref={toolbarRef}
+              onScroll={checkScroll}
+              onFocus={checkScroll}
+              className="flex flex-nowrap items-center gap-1 overflow-x-auto [scrollbar-width:none] [-ms-overflow-style:none] [&::-webkit-scrollbar]:hidden sm:flex-wrap sm:gap-0.5 sm:overflow-visible"
+              role="toolbar"
+              aria-label="Formatting"
+            >
+              {WRITE_TOOLS.map((tool) => (
+                <ToolbarButton
+                  key={tool.label}
+                  label={tool.label}
+                  shortcut={shortcutLabelFor(tool.action, isApple)}
+                  disabled={disabled}
+                  icon={tool.icon}
+                  onClick={() => applyAction(tool.action as FormatAction)}
+                />
+              ))}
+              {/* Mention: @ inside a speech bubble. */}
+              {users?.length ? (
+                <ToolbarButton
+                  label="Mention"
+                  shortcut={`${isApple ? "⌘" : "Ctrl+"}Space`}
+                  disabled={disabled}
+                  icon={<MentionIcon />}
+                  onClick={() => insertAtCaret("@")}
+                />
+              ) : null}
+            </div>
+            {canScrollLeft && (
+              <div
+                aria-hidden="true"
+                data-testid="fade-cue-left"
+                className="pointer-events-none absolute inset-y-0 left-0 w-4 bg-gradient-to-r from-slate-50 to-transparent sm:hidden"
               />
-            ))}
-            {/* Mention: @ inside a speech bubble. */}
-            {users?.length ? (
-              <ToolbarButton
-                label="Mention"
-                shortcut={`${isApple ? "⌘" : "Ctrl+"}Space`}
-                disabled={disabled}
-                icon={<MentionIcon />}
-                onClick={() => insertAtCaret("@")}
+            )}
+            {canScrollRight && (
+              <div
+                aria-hidden="true"
+                data-testid="fade-cue-right"
+                className="pointer-events-none absolute inset-y-0 right-0 w-6 bg-gradient-to-l from-slate-50 to-transparent sm:hidden"
               />
-            ) : null}
+            )}
           </div>
         </div>
 
@@ -505,16 +725,33 @@ export const MarkdownEditor = forwardRef<
         ) : null}
       </div>
 
+      {uploadError ? (
+        <div role="alert" className="flex items-start justify-between gap-2 rounded-md bg-red-50 px-2 py-1 text-xs text-red-700">
+          <span>{uploadError}</span>
+          <button
+            type="button"
+            className="shrink-0 font-medium underline-offset-2 hover:underline"
+            onClick={() => setUploadError(null)}
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : null}
+      <p aria-live="polite" className="text-xs text-slate-500 empty:hidden">
+        {uploading > 0 ? `Uploading ${uploading} file${uploading === 1 ? "" : "s"}…` : ""}
+      </p>
+
       <div className="flex flex-wrap items-start justify-between gap-2">
         {footer}
         {maxLength ? (
-          <p
-            className={`ml-auto shrink-0 text-xs tabular-nums ${
-              value.length > maxLength ? "text-red-600" : "text-slate-500"
-            }`}
-          >
-            {value.length}/{maxLength}
-          </p>
+          <div className="ml-auto flex shrink-0 items-center gap-2">
+            {!disabled ? <span className="text-xs text-slate-500">Paste or drop images · </span> : null}
+            <CharacterCounter
+              length={value.length}
+              max={maxLength}
+              className="shrink-0"
+            />
+          </div>
         ) : null}
       </div>
     </div>
@@ -543,14 +780,12 @@ function TabButton({
   return (
     <button
       type="button"
-      role="tab"
-      aria-selected={active}
+      aria-pressed={active}
       aria-disabled={disabled || undefined}
       title={title}
       disabled={disabled}
-      onMouseDown={(event) => event.preventDefault()}
       onClick={onClick}
-      className={`inline-flex items-center gap-1 rounded px-2 py-1 text-xs font-medium transition ${
+      className={`inline-flex shrink-0 items-center gap-1 rounded px-2.5 py-1.5 sm:px-2 sm:py-1 text-xs font-medium transition ${
         active
           ? "bg-white text-slate-900 shadow-sm ring-1 ring-slate-300"
           : "text-slate-600 hover:text-slate-900"
@@ -600,7 +835,15 @@ function MentionList({
               }}
               onMouseEnter={() => onHover(index)}
             >
-              {user.name}
+              {user.agentOwner ? (
+                <span className="flex min-w-0 items-center gap-1.5">
+                  <span className="truncate">{user.name}</span>
+                  <AgentMentionBadge />
+                  <span className="truncate text-slate-500">· {user.agentOwner}</span>
+                </span>
+              ) : (
+                user.name
+              )}
             </button>
           </li>
         );

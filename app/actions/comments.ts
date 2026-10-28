@@ -1,15 +1,22 @@
 "use server";
 
 import { revalidatePath } from "next/cache";
+import { revalidateIssue } from "@/lib/revalidate-issue";
 import { Prisma } from "@prisma/client";
 import { prisma } from "@/lib/prisma";
+import { commentInTenant, currentTenantIdFor } from "@/lib/tenant-context";
+import { currentTenantAccess } from "@/lib/tenant-access";
+import { attachmentIdsInMarkdown, linkAttachments } from "@/lib/attachment-link";
 import { requireUser } from "@/lib/auth-helpers";
-import { commentSchema } from "@/lib/validations/bug";
+import { commentSchema } from "@/lib/validations/issue";
 import {
   extractMentionedUserIds,
+  newlyMentionedAgentIds,
   newlyMentionedUserIds,
   normalizeMentions,
 } from "@/lib/mentions";
+import { agentMentionNames, agentOwnerIds, mentionedAgents } from "@/lib/agent-mentions";
+import { tenantMemberWhere } from "@/lib/tenant-mentions";
 import {
   canDeleteComment,
   canEditComment,
@@ -21,13 +28,19 @@ import {
   commentPreview,
 } from "@/lib/activity-log";
 import { notifyLater } from "@/lib/notify";
+import {
+  consumeRateLimit,
+  ACTION_RATE_LIMITS,
+  RATE_LIMIT_MESSAGE,
+} from "@/lib/rate-limit";
+import { publishWebEvent } from "@/lib/agent-api/web-events";
 
 export type CommentActionResult = { error?: string; ok?: boolean };
 
-async function loadComment(commentId: unknown) {
+async function loadComment(commentId: unknown, tenantId: string | null) {
   if (typeof commentId !== "string" || commentId.trim().length === 0) return null;
   return prisma.comment.findUnique({
-    where: { id: commentId },
+    where: { id: commentId, ...commentInTenant(tenantId) },
     select: {
       id: true,
       bugId: true,
@@ -35,7 +48,7 @@ async function loadComment(commentId: unknown) {
       body: true,
       deletedAt: true,
       author: { select: { name: true } },
-      bug: { select: { isDeleted: true, title: true } },
+      bug: { select: { isDeleted: true, title: true, tenantId: true } },
     },
   });
 }
@@ -46,7 +59,16 @@ export async function updateCommentAction(
   formData: FormData,
 ): Promise<CommentActionResult> {
   const user = await requireUser();
-  const comment = await loadComment(commentId);
+
+  const limit = await consumeRateLimit(
+    `edit-comment:${user.id}`,
+    ACTION_RATE_LIMITS.editComment,
+  );
+  if (!limit.allowed) {
+    return { error: RATE_LIMIT_MESSAGE };
+  }
+
+  const comment = await loadComment(commentId, await currentTenantIdFor(user.id));
   if (!comment) return { error: COMMENT_ERRORS.notFound };
   if (comment.bug.isDeleted) return { error: COMMENT_ERRORS.issueDeleted };
   if (comment.deletedAt) return { error: COMMENT_ERRORS.deleted };
@@ -60,19 +82,34 @@ export async function updateCommentAction(
   const mentionedIds = extractMentionedUserIds(parsed.data.body);
   const known = mentionedIds.length
     ? await prisma.user.findMany({
-        where: { id: { in: mentionedIds } },
+        where: { id: { in: mentionedIds }, ...tenantMemberWhere(comment.bug.tenantId) },
         select: { id: true, name: true },
       })
     : [];
+  // #603: agent tags survive only for agents in this issue's organization.
+  const agents = await mentionedAgents(prisma, comment.bug.tenantId, parsed.data.body);
   const body = normalizeMentions(
     parsed.data.body,
-    new Map(known.map((u) => [u.id, u.name])),
+    new Map([
+      ...known.map((u) => [u.id, u.name] as [string, string]),
+      ...agentMentionNames(agents),
+    ]),
   );
 
-  await prisma.$transaction(async (tx) => {
-    await tx.comment.update({
-      where: { id: comment.id },
+  const result = await prisma.$transaction(async (tx) => {
+    const updated = await tx.comment.updateMany({
+      where: { id: comment.id, deletedAt: null },
       data: { body, editedAt: new Date() },
+    });
+    if (updated.count === 0) {
+      return { error: COMMENT_ERRORS.deleted };
+    }
+    // Images pasted while editing (#305).
+    await linkAttachments(tx, {
+      ids: attachmentIdsInMarkdown(body),
+      uploaderId: user.id,
+      bugId: comment.bugId,
+      commentId: comment.id,
     });
 
     await tx.bugActivity.updateMany({
@@ -90,9 +127,28 @@ export async function updateCommentAction(
         } as Prisma.InputJsonValue,
       },
     });
+    // #600: agents following the thread see the edit.
+    await publishWebEvent(tx, {
+      bugId: comment.bugId,
+      type: "comment.edited",
+      actorUserId: user.id,
+      payload: { commentId: comment.id, authorId: comment.authorId },
+    });
+
+    return { ok: true as const };
   });
 
-  const newlyMentioned = newlyMentionedUserIds(comment.body, body);
+  if (result.error) {
+    return result;
+  }
+
+  const newlyMentionedAgents = new Set(newlyMentionedAgentIds(comment.body, body));
+  const newlyMentioned = [
+    ...new Set([
+      ...newlyMentionedUserIds(comment.body, body),
+      ...agentOwnerIds(agents.filter((agent) => newlyMentionedAgents.has(agent.id))),
+    ]),
+  ];
   if (newlyMentioned.length > 0) {
     notifyLater({
       kind: "mentioned",
@@ -101,11 +157,13 @@ export async function updateCommentAction(
       bugId: comment.bugId,
       bugTitle: comment.bug.title,
       place: "comment",
+      commentId: comment.id,
       recipientIds: newlyMentioned,
       excerpt: commentPreview(body),
     });
   }
 
+  revalidateIssue(comment.bugId);
   revalidatePath(`/bugs/${comment.bugId}`);
   return { ok: true };
 }
@@ -120,22 +178,26 @@ export async function deleteCommentAction(
   commentId: string,
 ): Promise<CommentActionResult> {
   const user = await requireUser();
-  const comment = await loadComment(commentId);
+  const comment = await loadComment(commentId, await currentTenantIdFor(user.id));
   if (!comment) return { error: COMMENT_ERRORS.notFound };
   if (comment.bug.isDeleted) return { error: COMMENT_ERRORS.issueDeleted };
   if (comment.deletedAt) return { error: COMMENT_ERRORS.deleted };
-  if (!canDeleteComment(user.id, user.role, comment)) {
+  const access = await currentTenantAccess(user.id, user.role);
+  if (!canDeleteComment(user.id, user.role, comment, access.admin)) {
     return { error: COMMENT_ERRORS.cannotDelete };
   }
 
   const isModeration = comment.authorId !== user.id;
 
   try {
-    await prisma.$transaction(async (tx) => {
-      await tx.comment.update({
-        where: { id: comment.id },
+    const result = await prisma.$transaction(async (tx) => {
+      const updated = await tx.comment.updateMany({
+        where: { id: comment.id, deletedAt: null },
         data: { body: "", deletedAt: new Date() },
       });
+      if (updated.count === 0) {
+        return { error: COMMENT_ERRORS.deleted };
+      }
       // A deleted comment's files go too, e.g. a screenshot posted by mistake (#215).
       await tx.attachment.deleteMany({ where: { commentId: comment.id } });
 
@@ -163,12 +225,25 @@ export async function deleteCommentAction(
           },
         });
       }
+      await publishWebEvent(tx, {
+        bugId: comment.bugId,
+        type: "comment.deleted",
+        actorUserId: user.id,
+        payload: { commentId: comment.id, authorId: comment.authorId, moderated: isModeration },
+      });
+
+      return { ok: true as const };
     });
+
+    if ("error" in result) {
+      return result;
+    }
   } catch (error) {
     console.error("Failed to delete comment:", error);
     return { error: COMMENT_ERRORS.failed };
   }
 
+  revalidateIssue(comment.bugId);
   revalidatePath(`/bugs/${comment.bugId}`);
   return { ok: true };
 }

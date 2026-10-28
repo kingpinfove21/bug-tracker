@@ -3,8 +3,9 @@
 import { revalidatePath } from "next/cache";
 import { expireTag, TAGS } from "@/lib/lookups";
 import { prisma } from "@/lib/prisma";
-import { requireAdmin } from "@/lib/auth-helpers";
-import { canDeleteIssueType, issueTypeInputSchema } from "@/lib/issue-types";
+import { requireUser } from "@/lib/auth-helpers";
+import { canDeleteIssueType, issueTypeInputSchema, issueTypeScopeFor } from "@/lib/issue-types";
+import { typeChangedSummary } from "@/lib/activity-log";
 import { normalizeTemplate } from "@/lib/issue-templates";
 
 export type IssueTypeActionResult = { error?: string; ok?: boolean };
@@ -21,7 +22,8 @@ function isRecordNotFound(err: unknown): boolean {
 export async function createIssueTypeAction(
   formData: FormData,
 ): Promise<IssueTypeActionResult> {
-  await requireAdmin();
+  const scope = await issueTypeScopeFor(await requireUser());
+  if (!scope.ok) return { error: scope.error };
 
   const rawName = formData.get("name")?.toString() ?? "";
   const rawDesc = formData.get("description")?.toString() ?? "";
@@ -45,6 +47,7 @@ export async function createIssueTypeAction(
 
   const existing = await prisma.issueType.findFirst({
     where: {
+      tenantId: scope.tenantId,
       name: {
         equals: normalizedName,
         mode: "insensitive",
@@ -59,6 +62,7 @@ export async function createIssueTypeAction(
   try {
     await prisma.issueType.create({
       data: {
+        tenantId: scope.tenantId,
         name: normalizedName,
         description: parsed.data.description,
         template: normalizeTemplate(parsed.data.template),
@@ -79,6 +83,7 @@ export async function createIssueTypeAction(
 
   expireTag(TAGS.issueTypes);
   revalidatePath("/admin/types");
+  revalidatePath("/issues/new");
   revalidatePath("/bugs/new");
   return { ok: true };
 }
@@ -87,7 +92,9 @@ export async function updateIssueTypeAction(
   id: string,
   formData: FormData,
 ): Promise<IssueTypeActionResult> {
-  await requireAdmin();
+  const user = await requireUser();
+  const scope = await issueTypeScopeFor(user);
+  if (!scope.ok) return { error: scope.error };
 
   if (!id || typeof id !== "string") {
     return { error: "Invalid type ID" };
@@ -113,8 +120,17 @@ export async function updateIssueTypeAction(
 
   const normalizedName = parsed.data.name.trim();
 
+  const currentType = await prisma.issueType.findFirst({
+    where: { id, tenantId: scope.tenantId },
+  });
+
+  if (!currentType) {
+    return { error: TYPE_NOT_FOUND };
+  }
+
   const existing = await prisma.issueType.findFirst({
     where: {
+      tenantId: scope.tenantId,
       name: {
         equals: normalizedName,
         mode: "insensitive",
@@ -127,17 +143,52 @@ export async function updateIssueTypeAction(
     return { error: `Another type named "${existing.name}" already exists.` };
   }
 
+  let linkedBugIds: string[] = [];
+
   try {
-    await prisma.issueType.update({
-      where: { id },
-      data: {
-        name: normalizedName,
-        description: parsed.data.description,
-        ...(typeof rawTemplate === "string"
-          ? { template: normalizeTemplate(parsed.data.template) }
-          : {}),
-        isActive: parsed.data.isActive,
-      },
+    await prisma.$transaction(async (tx) => {
+      const current = await tx.issueType.findFirst({
+        where: { id, tenantId: scope.tenantId },
+      });
+      if (!current) {
+        return;
+      }
+
+      await tx.issueType.update({
+        where: { id },
+        data: {
+          name: normalizedName,
+          description: parsed.data.description,
+          ...(typeof rawTemplate === "string"
+            ? { template: normalizeTemplate(parsed.data.template) }
+            : {}),
+          isActive: parsed.data.isActive,
+        },
+      });
+
+      if (current.name !== normalizedName) {
+        const linkedBugs = await tx.bug.findMany({
+          where: { typeId: id, tenantId: scope.tenantId },
+          select: { id: true },
+        });
+
+        if (linkedBugs.length > 0) {
+          linkedBugIds = linkedBugs.map((b) => b.id);
+          await tx.bugActivity.createMany({
+            data: linkedBugs.map((b) => ({
+              bugId: b.id,
+              actorId: user.id,
+              type: "type_changed",
+              summary: typeChangedSummary(current.name, normalizedName),
+              metadata: {
+                field: "type",
+                from: current.name,
+                to: normalizedName,
+              },
+            })),
+          });
+        }
+      }
     });
   } catch (err: unknown) {
     if (
@@ -156,22 +207,28 @@ export async function updateIssueTypeAction(
 
   expireTag(TAGS.issueTypes);
   revalidatePath("/admin/types");
+  revalidatePath("/issues/new");
+  revalidatePath("/issues");
   revalidatePath("/bugs/new");
   revalidatePath("/bugs");
+  for (const bugId of linkedBugIds) {
+    revalidatePath(`/bugs/${bugId}`);
+  }
   return { ok: true };
 }
 
 export async function toggleIssueTypeActiveAction(
   id: string,
 ): Promise<IssueTypeActionResult> {
-  await requireAdmin();
+  const scope = await issueTypeScopeFor(await requireUser());
+  if (!scope.ok) return { error: scope.error };
 
   if (!id || typeof id !== "string") {
     return { error: "Invalid type ID" };
   }
 
-  const existing = await prisma.issueType.findUnique({
-    where: { id },
+  const existing = await prisma.issueType.findFirst({
+    where: { id, tenantId: scope.tenantId },
     select: { isActive: true },
   });
 
@@ -186,6 +243,7 @@ export async function toggleIssueTypeActiveAction(
 
   expireTag(TAGS.issueTypes);
   revalidatePath("/admin/types");
+  revalidatePath("/issues/new");
   revalidatePath("/bugs/new");
   return { ok: true };
 }
@@ -193,14 +251,15 @@ export async function toggleIssueTypeActiveAction(
 export async function deleteIssueTypeAction(
   id: string,
 ): Promise<IssueTypeActionResult> {
-  await requireAdmin();
+  const scope = await issueTypeScopeFor(await requireUser());
+  if (!scope.ok) return { error: scope.error };
 
   if (!id || typeof id !== "string") {
     return { error: "Invalid type ID" };
   }
 
-  const existing = await prisma.issueType.findUnique({
-    where: { id },
+  const existing = await prisma.issueType.findFirst({
+    where: { id, tenantId: scope.tenantId },
     select: { id: true },
   });
 
@@ -209,7 +268,7 @@ export async function deleteIssueTypeAction(
   }
 
   const count = await prisma.bug.count({
-    where: { typeId: id },
+    where: { typeId: id, tenantId: scope.tenantId },
   });
 
   const check = canDeleteIssueType(count);
@@ -230,7 +289,7 @@ export async function deleteIssueTypeAction(
 
   expireTag(TAGS.issueTypes);
   revalidatePath("/admin/types");
+  revalidatePath("/issues/new");
   revalidatePath("/bugs/new");
   return { ok: true };
 }
-

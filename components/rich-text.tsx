@@ -1,9 +1,10 @@
-import type { ReactNode } from "react";
+import { Fragment, type ReactNode } from "react";
 import {
   inlineImageSrc,
   looksLikeMarkdown,
   safeHref,
   stripLegacyMarkup,
+  tokenizeInline,
 } from "@/lib/rich-text";
 
 type RichTextProps = {
@@ -51,7 +52,7 @@ const LIST_ITEM_RE = /^(\s*)([-*+]|\d{1,9}[.)])\s+(.*)$/;
 const TASK_MARKER_RE = /^\[([ xX])\]\s+(.*)$/;
 const HEADING_RE = /^(#{1,6})\s+(.*)$/;
 const QUOTE_RE = /^>\s?(.*)$/;
-const FENCE_RE = /^```/;
+const FENCE_RE = /^ {0,3}(`{3,}|~{3,})/;
 const RULE_RE = /^\s*(?:(?:-\s*){3,}|(?:\*\s*){3,}|(?:_\s*){3,})$/;
 
 type ListItem = {
@@ -133,7 +134,24 @@ function isBlockStart(line: string): boolean {
   );
 }
 
+/**
+ * Render sibling items, starting a new list whenever the marker type switches
+ * between ordered and unordered, so `1. a` then `- b` stays an ol + ul (#725).
+ */
 function renderListItems(items: ListItem[], renderMentions?: (text: string) => ReactNode) {
+  const runs: ListItem[][] = [];
+  for (const item of items) {
+    const run = runs[runs.length - 1];
+    if (run && run[0]?.ordered === item.ordered) run.push(item);
+    else runs.push([item]);
+  }
+  if (runs.length <= 1) return renderListRun(items, renderMentions);
+  return runs.map((run, index) => (
+    <Fragment key={index}>{renderListRun(run, renderMentions)}</Fragment>
+  ));
+}
+
+function renderListRun(items: ListItem[], renderMentions?: (text: string) => ReactNode) {
   if (items.length === 0) return null;
   const ordered = items[0]?.ordered ?? false;
   const start = ordered ? items[0]?.orderNumber : undefined;
@@ -209,17 +227,32 @@ function renderBlocks(
       continue;
     }
 
-    if (FENCE_RE.test(line)) {
+    const open = FENCE_RE.exec(line);
+    if (open) {
+      // Only a bare fence of the same character, at least as long, closes the
+      // block, so a ``` sample inside a ```` block stays code (#723).
+      const marker = open[1] ?? "```";
+      const isClose = (candidate: string) => {
+        const close = FENCE_RE.exec(candidate)?.[1];
+        return (
+          !!close &&
+          close[0] === marker[0] &&
+          close.length >= marker.length &&
+          candidate.trim() === close
+        );
+      };
       const fence: string[] = [];
       i += 1;
-      while (i < lines.length && !FENCE_RE.test(lines[i] ?? "")) {
+      while (i < lines.length && !isClose(lines[i] ?? "")) {
         fence.push(lines[i] ?? "");
         i += 1;
       }
       if (i < lines.length) i += 1;
       nodes.push(
         /* Focusable so a keyboard user can scroll a long line: a code block
-           overflows on purpose, and axe flags an unreachable scroll region. */
+           overflows on purpose, and axe flags an unreachable scroll region.
+           A focusable scroll container is the fix, not the bug. */
+        // eslint-disable-next-line jsx-a11y/no-noninteractive-tabindex
         <pre key={`pre-${key++}`} tabIndex={0} role="group" aria-label="Code block">
           <code>{fence.join("\n")}</code>
         </pre>,
@@ -291,72 +324,8 @@ function renderBlocks(
   return nodes;
 }
 
-type InlineToken =
-  | { type: "text"; value: string }
-  | { type: "code"; value: string }
-  | { type: "bold"; value: string }
-  | { type: "italic"; value: string }
-  | { type: "strikethrough"; value: string }
-  | { type: "link"; label: string; href: string }
-  | { type: "image"; alt: string; src: string }
-  | { type: "autolink"; href: string };
 
-/**
- * Links require an http(s) href so soft-mentions `@[Name](userId)` stay text,
- * and bare URLs are linked automatically.
- */
-const INLINE_RE =
-  /(!?\[[^\]]*\]\((?:https?:\/\/|mailto:)[^)\s]*\)|`[^`]+`|\*\*[^*]+\*\*|__[^_]+__|~~[^~]+~~|\*[^*\s][^*]*\*|(?<![\w])_[^_\s][^_]*_(?![\w])|(?<![\w/.-])(https?:\/\/[^\s<>()]+))/g;
 
-const MARKDOWN_TARGET_RE = /^(!?)\[([^\]]*)\]\(([^)\s]+)\)$/;
-const TRAILING_PUNCTUATION_RE = /[.,;:!?]+$/;
-
-function tokenizeInline(text: string): InlineToken[] {
-  const tokens: InlineToken[] = [];
-  let last = 0;
-
-  for (const match of text.matchAll(INLINE_RE)) {
-    const index = match.index ?? 0;
-    if (index > last) {
-      tokens.push({ type: "text", value: text.slice(last, index) });
-    }
-    const raw = match[0];
-
-    const target = MARKDOWN_TARGET_RE.exec(raw);
-    if (target) {
-      if (target[1] === "!") {
-        tokens.push({ type: "image", alt: target[2] ?? "", src: target[3] ?? "" });
-      } else {
-        tokens.push({ type: "link", label: target[2] ?? raw, href: target[3] ?? "" });
-      }
-    } else if (raw.startsWith("`")) {
-      tokens.push({ type: "code", value: raw.slice(1, -1) });
-    } else if (raw.startsWith("**") || raw.startsWith("__")) {
-      tokens.push({ type: "bold", value: raw.slice(2, -2) });
-    } else if (raw.startsWith("~~")) {
-      tokens.push({ type: "strikethrough", value: raw.slice(2, -2) });
-    } else if (
-      (raw.startsWith("*") && raw.endsWith("*")) ||
-      (raw.startsWith("_") && raw.endsWith("_"))
-    ) {
-      tokens.push({ type: "italic", value: raw.slice(1, -1) });
-    } else {
-      const href = raw.replace(TRAILING_PUNCTUATION_RE, "");
-      tokens.push({ type: "autolink", href });
-      if (href !== raw) {
-        tokens.push({ type: "text", value: raw.slice(href.length) });
-      }
-    }
-
-    last = index + raw.length;
-  }
-
-  if (last < text.length) {
-    tokens.push({ type: "text", value: text.slice(last) });
-  }
-
-  return tokens.length > 0 ? tokens : [{ type: "text", value: text }];
-}
 
 function renderInline(
   text: string,

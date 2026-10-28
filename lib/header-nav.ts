@@ -1,23 +1,51 @@
-import { isAdmin, isSuperAdmin, type AppRole } from "@/lib/roles";
+import { isSuperAdmin, type AppRole } from "@/lib/roles";
+import { isAgentPlatformEnabled } from "@/lib/feature-flags";
 
-export type HeaderNavItem = { href: string; label: string };
+export type HeaderNavSubItem = {
+  href: string;
+  label: string;
+  description?: string;
+  badge?: number;
+};
 
-/** Links shown in the header for the role the user is currently viewing as. */
-export function headerNavItems(role?: AppRole | null): HeaderNavItem[] {
+export type HeaderNavItem = {
+  href: string;
+  label: string;
+  badge?: number;
+  children?: HeaderNavSubItem[];
+};
+
+/** #444: pick another tenant, create one, or accept an invite. */
+export const SWITCH_TENANT_LINK: HeaderNavItem = { href: "/tenants", label: "Switch workspace" };
+
+/** Links shown in the header for the role the user is currently viewing as (#761). */
+export function headerNavItems(
+  role?: AppRole | null,
+  options?: { agentPlatform?: boolean; pendingEscalations?: number },
+): HeaderNavItem[] {
+  const pending =
+    typeof options?.pendingEscalations === "number" && options.pendingEscalations > 0
+      ? options.pendingEscalations
+      : undefined;
+
   const items: HeaderNavItem[] = [
-    { href: "/bugs", label: "Issues" },
-    // #289: everyone can see what's left for a release.
-    { href: "/milestones", label: "Milestones" },
+    { href: "/issues", label: "Issues" },
   ];
-  if (isAdmin(role)) {
-    items.push(
-      { href: "/admin/categories", label: "Platforms" },
-      { href: "/admin/types", label: "Types" },
-    );
+
+  if (options?.agentPlatform ?? isAgentPlatformEnabled()) {
+    items.push({
+      href: "/escalations",
+      label: "Escalations",
+      ...(pending ? { badge: pending } : {}),
+    });
+  } else {
+    items.push({ href: "/docs", label: "API Docs" });
   }
+
   if (isSuperAdmin(role)) {
     items.push({ href: "/admin/users", label: "Admins" });
   }
+
   return items;
 }
 
@@ -28,8 +56,36 @@ export function headerNavItems(role?: AppRole | null): HeaderNavItem[] {
 export function isNavItemActive(pathname: string | null, href: string): boolean {
   if (!pathname) return false;
   const path = pathname.replace(/\/+$/, "") || "/";
-  if (href === "/bugs") {
-    return path === "/bugs" || (path.startsWith("/bugs/") && path !== "/bugs/new");
+  if (href === "/issues" || href === "/bugs") {
+    return (
+      path === "/issues" ||
+      path === "/bugs" ||
+      ((path.startsWith("/issues/") || path.startsWith("/bugs/")) &&
+        path !== "/issues/new" &&
+        path !== "/bugs/new")
+    );
+  }
+  if (href === "/escalations" || href === "/questions") {
+    return (
+      path === "/escalations" ||
+      path.startsWith("/escalations/") ||
+      path === "/questions" ||
+      path.startsWith("/questions/") ||
+      path === "/redesigns" ||
+      path.startsWith("/redesigns/")
+    );
+  }
+  if (href === "/manage-project") {
+    return (
+      path === "/projects" ||
+      path.startsWith("/projects/") ||
+      path === "/milestones" ||
+      path.startsWith("/milestones/") ||
+      path === "/admin/categories" ||
+      path.startsWith("/admin/categories/") ||
+      path === "/admin/types" ||
+      path.startsWith("/admin/types/")
+    );
   }
   return path === href || path.startsWith(`${href}/`);
 }
