@@ -116,6 +116,19 @@ describe("issue list layout", () => {
     expect(html).not.toContain('href="/issues/new"');
   });
 
+  it("offers Clear filters only when a filter is active", async () => {
+    count.mockImplementation(async (args: { where?: { status?: unknown } }) =>
+      args?.where?.status ? 0 : 5,
+    );
+    findMany.mockResolvedValue([]);
+
+    const filtered = await renderList({ severity: "critical" });
+    expect(filtered).toContain("Clear filters");
+
+    const unfiltered = await renderList();
+    expect(unfiltered).not.toContain("Clear filters");
+  });
+
   it("welcomes a new, empty project even when the workspace has issues elsewhere", async () => {
     // Other projects in tenant-acme have 5 issues; project-acme has none.
     count.mockImplementation(async (args: { where?: { projectId?: unknown } }) =>

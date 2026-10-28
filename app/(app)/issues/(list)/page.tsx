@@ -331,6 +331,18 @@ export default async function BugsPage({
 
   const isResolvedView = statusParam === "resolved";
 
+  const hasActiveFilters = Boolean(
+    qParam?.trim() ||
+      statusParam ||
+      severityParam ||
+      tagsParam ||
+      selectedPlatform ||
+      selectedArea ||
+      selectedMilestone ||
+      stageView ||
+      (mineFilter && mineFilter !== "watching"),
+  );
+
   let platformTabs: PlatformTab[] = [];
   if (!isDeletedView) {
     try {
@@ -750,26 +762,10 @@ export default async function BugsPage({
           {isFirstRun ? (
             <FirstRunWelcome isAdmin={canDelete} hasTenant={Boolean(tenantId)} />
           ) : bugs.length === 0 ? (
-            <div className="rounded-xl border border-slate-200 bg-white px-4 py-5">
-              <p className="text-sm font-medium text-slate-800">
-                {isWatchingView && !qParam && !statusParam && !severityParam && !tagsParam && !selectedPlatform && !selectedMilestone
-                  ? "You're not watching any issues."
-                  : "No issues match these filters."}
-              </p>
-              <p className="mt-1 text-sm text-slate-600">
-                {isWatchingView
-                  ? "You watch issues you report, are assigned to or comment on, and any you choose to watch from the issue page."
-                  : "Try clearing filters, or report it with New issue at the top."}
-              </p>
-              <div className="mt-3 flex flex-wrap items-center gap-3">
-                <Link
-                  href="/issues"
-                  className="text-sm font-medium text-blue-600 hover:underline"
-                >
-                  Clear filters
-                </Link>
-              </div>
-            </div>
+            <NoMatchingIssues
+              isWatching={isWatchingView}
+              hasActiveFilters={hasActiveFilters}
+            />
           ) : (
             <>
               <ul className="divide-y divide-slate-100 overflow-hidden rounded-xl border border-slate-200 bg-white">
@@ -1025,6 +1021,55 @@ export default async function BugsPage({
     >
       {page}
     </BulkSelectionProvider>
+  );
+}
+
+/** Playful zero-results state: the tracker has issues, but none match. */
+function NoMatchingIssues({
+  isWatching,
+  hasActiveFilters,
+}: {
+  isWatching: boolean;
+  hasActiveFilters: boolean;
+}) {
+  const quietWatchlist = isWatching && !hasActiveFilters;
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-white px-6 py-10 text-center">
+      <div
+        aria-hidden="true"
+        className="mx-auto flex h-20 w-20 items-center justify-center rounded-full bg-teal-50 text-5xl ring-1 ring-teal-100"
+      >
+        {quietWatchlist ? "👀" : "🕵️"}
+      </div>
+      <h2 className="mt-4 text-lg font-semibold text-slate-900">
+        {quietWatchlist
+          ? "Nothing on your watchlist yet"
+          : "It's quiet here… too quiet."}
+      </h2>
+      <p className="mx-auto mt-2 max-w-md text-sm text-slate-600">
+        {quietWatchlist
+          ? "You watch issues you report, are assigned to, or comment on. They'll appear here when there's movement."
+          : "No issues match these filters. Try a broader search — or clear them to see everything."}
+      </p>
+      <div className="mt-5 flex flex-wrap items-center justify-center gap-3">
+        {hasActiveFilters ? (
+          <Link
+            href="/issues"
+            className="inline-flex h-9 items-center justify-center rounded-full bg-teal-700 px-4 text-sm font-medium text-white transition hover:bg-teal-800 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
+          >
+            Clear filters
+          </Link>
+        ) : quietWatchlist ? (
+          <Link
+            href="/issues"
+            className="inline-flex h-9 items-center justify-center rounded-full border border-slate-300 bg-white px-4 text-sm font-medium text-slate-700 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-teal-600 focus-visible:ring-offset-2"
+          >
+            Browse all issues
+          </Link>
+        ) : null}
+      </div>
+    </div>
   );
 }
 

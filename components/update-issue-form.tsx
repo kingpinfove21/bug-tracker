@@ -35,6 +35,18 @@ const sameDraft = (a: Draft, b: Draft) =>
 const selectClass =
   "w-full rounded-lg border border-slate-300 bg-white px-3 py-2 text-sm text-slate-900 shadow-xs focus:border-teal-500 focus:outline-none focus:ring-1 focus:ring-teal-500";
 
+// Loaded on demand so the canvas code never runs during SSR.
+async function celebrateResolution() {
+  const { default: confetti } = await import("canvas-confetti");
+  confetti({
+    particleCount: 90,
+    spread: 70,
+    origin: { y: 0.7 },
+    colors: ["#22c55e", "#3b82f6", "#f59e0b", "#ec4899"],
+    disableForReducedMotion: true,
+  });
+}
+
 export function UpdateIssueForm({
   bugId,
   status,
@@ -133,8 +145,11 @@ export function UpdateIssueForm({
         event.preventDefault();
         setError(null);
         markSaved(false);
+        const nextStatus = draft.status;
+        const celebrates =
+          !isFinishedStatus(status) && isFinishedStatus(nextStatus);
         const formData = new FormData();
-        formData.set("status", draft.status);
+        formData.set("status", nextStatus);
         if (asksForNote) formData.set("resolutionNote", note);
         if (canEditTriage) {
           formData.set("typeId", draft.typeId);
@@ -153,6 +168,9 @@ export function UpdateIssueForm({
           } else {
             markSaved(true);
             setNote("");
+            if (celebrates) {
+              void celebrateResolution().catch(() => {});
+            }
           }
         });
       }}

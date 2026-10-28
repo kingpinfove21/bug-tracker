@@ -42,4 +42,15 @@ describe("UpdateIssueForm", () => {
     expect(source).toContain("const wasUnedited = sameDraft(draft, lastServer);");
     expect(source).toContain("if (wasUnedited) setDraft(serverDraft);");
   });
+
+  it("fires confetti only after a successful move into resolved or closed", () => {
+    expect(source).toContain(
+      "!isFinishedStatus(status) && isFinishedStatus(nextStatus)",
+    );
+    expect(source).toMatch(
+      /} else \{\s*markSaved\(true\);\s*setNote\(""\);\s*if \(celebrates\) \{\s*void celebrateResolution\(\)\.catch\(\(\) => \{\}\);\s*\}/,
+    );
+    expect(source).toContain('await import("canvas-confetti")');
+    expect(source).toContain("disableForReducedMotion: true");
+  });
 });
